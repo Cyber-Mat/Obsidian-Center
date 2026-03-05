@@ -9,4 +9,7 @@ require (
 	golang.org/x/crypto v0.48.0
 )
 
-require golang.org/x/sys v0.41.0 // indirect
+require (
+	github.com/automerge/automerge-go v0.0.0-20241030180337-6fb4f2d08244 // indirect
+	golang.org/x/sys v0.41.0 // indirect
+)

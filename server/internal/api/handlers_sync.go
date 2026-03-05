@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"sync"
+	gosync "sync"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
+	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
+	"github.com/automerge/automerge-go"
 	"github.com/gorilla/websocket"
 )
 
@@ -17,43 +19,44 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin:     func(r *http.Request) bool { return true }, // TODO: tighten in production
 }
 
+// SyncHandler manages WebSocket connections for CRDT sync.
 type SyncHandler struct {
 	vaults *vault.Store
 	jwt    *auth.JWTService
-	mu     sync.Mutex
+	engine *sync.Engine
+	mu     gosync.Mutex
 	hubs   map[string]*SyncHub
 }
 
-// SyncHub manages all WebSocket connections for a single vault
+// NewSyncHandler creates a SyncHandler with the given sync engine.
+func NewSyncHandler(vaults *vault.Store, jwt *auth.JWTService, engine *sync.Engine) *SyncHandler {
+	return &SyncHandler{
+		vaults: vaults,
+		jwt:    jwt,
+		engine: engine,
+		hubs:   make(map[string]*SyncHub),
+	}
+}
+
+// SyncHub manages all WebSocket connections for a single vault.
 type SyncHub struct {
 	vaultID string
 	clients map[*SyncClient]bool
-	mu      sync.RWMutex
+	mu      gosync.RWMutex
 }
 
+// SyncClient represents a single connected peer.
 type SyncClient struct {
-	conn    *websocket.Conn
-	userID  int64
-	send    chan []byte
-	hub     *SyncHub
-}
-
-type syncMessage struct {
-	Type string          `json:"type"`
-	Data json.RawMessage `json:"data"`
-}
-
-type authMessage struct {
-	Token string `json:"token"`
+	conn      *websocket.Conn
+	userID    int64
+	send      chan []byte
+	hub       *SyncHub
+	syncState *automerge.SyncState
 }
 
 func (h *SyncHandler) getOrCreateHub(vaultID string) *SyncHub {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	if h.hubs == nil {
-		h.hubs = make(map[string]*SyncHub)
-	}
 
 	hub, ok := h.hubs[vaultID]
 	if !ok {
@@ -81,28 +84,28 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	if tokenStr != "" {
 		claims, err := h.jwt.ValidateToken(tokenStr)
 		if err != nil {
-			conn.WriteJSON(syncMessage{Type: "error", Data: rawJSON(`{"message":"invalid token"}`)})
+			sendError(conn, "invalid token")
 			conn.Close()
 			return
 		}
 		userID = claims.UserID
 	} else {
 		// Read first message as auth
-		var msg syncMessage
-		if err := conn.ReadJSON(&msg); err != nil || msg.Type != "auth" {
-			conn.WriteJSON(syncMessage{Type: "error", Data: rawJSON(`{"message":"first message must be auth"}`)})
+		var msg sync.WireMessage
+		if err := conn.ReadJSON(&msg); err != nil || msg.Type != sync.MsgTypeAuth {
+			sendError(conn, "first message must be auth")
 			conn.Close()
 			return
 		}
-		var authMsg authMessage
-		if err := json.Unmarshal(msg.Data, &authMsg); err != nil {
-			conn.WriteJSON(syncMessage{Type: "error", Data: rawJSON(`{"message":"invalid auth message"}`)})
+		var authData sync.AuthData
+		if err := json.Unmarshal(msg.Data, &authData); err != nil {
+			sendError(conn, "invalid auth message")
 			conn.Close()
 			return
 		}
-		claims, err := h.jwt.ValidateToken(authMsg.Token)
+		claims, err := h.jwt.ValidateToken(authData.Token)
 		if err != nil {
-			conn.WriteJSON(syncMessage{Type: "error", Data: rawJSON(`{"message":"invalid token"}`)})
+			sendError(conn, "invalid token")
 			conn.Close()
 			return
 		}
@@ -111,17 +114,35 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// Verify vault ownership
 	if _, err := h.vaults.GetVault(vaultID, userID); err != nil {
-		conn.WriteJSON(syncMessage{Type: "error", Data: rawJSON(`{"message":"vault not found"}`)})
+		sendError(conn, "vault not found")
+		conn.Close()
+		return
+	}
+
+	// Ensure CRDT doc is loaded
+	if _, err := h.engine.GetDoc(vaultID); err != nil {
+		slog.Error("failed to load CRDT doc", "vault", vaultID, "error", err)
+		sendError(conn, "failed to load vault state")
+		conn.Close()
+		return
+	}
+
+	// Create per-client sync state
+	syncState, err := h.engine.NewSyncState(vaultID)
+	if err != nil {
+		slog.Error("failed to create sync state", "vault", vaultID, "error", err)
+		sendError(conn, "sync state error")
 		conn.Close()
 		return
 	}
 
 	hub := h.getOrCreateHub(vaultID)
 	client := &SyncClient{
-		conn:   conn,
-		userID: userID,
-		send:   make(chan []byte, 64),
-		hub:    hub,
+		conn:      conn,
+		userID:    userID,
+		send:      make(chan []byte, 64),
+		hub:       hub,
+		syncState: syncState,
 	}
 
 	hub.mu.Lock()
@@ -130,15 +151,29 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("sync client connected", "vault", vaultID, "user", userID)
 
-	// Send current snapshot on connect
-	snapshot, err := h.vaults.Snapshot(vaultID)
-	if err == nil {
-		data, _ := json.Marshal(map[string]interface{}{"files": snapshot})
-		conn.WriteJSON(syncMessage{Type: "snapshot", Data: data})
-	}
+	// Generate initial sync messages to bring client up to date
+	h.sendPendingSyncMessages(client)
 
 	go client.writePump()
 	go client.readPump(h)
+}
+
+// sendPendingSyncMessages generates and queues all pending sync messages for a client.
+func (h *SyncHandler) sendPendingSyncMessages(client *SyncClient) {
+	for {
+		msgBytes, valid := h.engine.GenerateSyncMessage(client.syncState)
+		if !valid {
+			break
+		}
+		data, _ := json.Marshal(sync.SyncData{Message: msgBytes})
+		wireMsg, _ := json.Marshal(sync.WireMessage{Type: sync.MsgTypeSync, Data: data})
+		select {
+		case client.send <- wireMsg:
+		default:
+			slog.Warn("client send buffer full during initial sync", "vault", client.hub.vaultID)
+			return
+		}
+	}
 }
 
 func (c *SyncClient) readPump(h *SyncHandler) {
@@ -151,7 +186,7 @@ func (c *SyncClient) readPump(h *SyncHandler) {
 	}()
 
 	for {
-		var msg syncMessage
+		var msg sync.WireMessage
 		if err := c.conn.ReadJSON(&msg); err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				slog.Error("websocket read error", "error", err)
@@ -160,12 +195,14 @@ func (c *SyncClient) readPump(h *SyncHandler) {
 		}
 
 		switch msg.Type {
-		case "put_file":
-			h.handlePutFile(c, msg.Data)
-		case "delete_file":
-			h.handleDeleteFile(c, msg.Data)
-		case "ping":
-			c.conn.WriteJSON(syncMessage{Type: "pong"})
+		case sync.MsgTypeSync:
+			h.handleSyncMessage(c, msg.Data)
+		case sync.MsgTypePing:
+			wireMsg, _ := json.Marshal(sync.WireMessage{Type: sync.MsgTypePong})
+			select {
+			case c.send <- wireMsg:
+			default:
+			}
 		}
 	}
 }
@@ -180,84 +217,47 @@ func (c *SyncClient) writePump() {
 	}
 }
 
-type putFileMessage struct {
-	Path    string `json:"path"`
-	Content []byte `json:"content"`
-}
-
-type deleteFileMessage struct {
-	Path string `json:"path"`
-}
-
-func (h *SyncHandler) handlePutFile(sender *SyncClient, data json.RawMessage) {
-	var msg putFileMessage
-	if err := json.Unmarshal(data, &msg); err != nil {
+func (h *SyncHandler) handleSyncMessage(sender *SyncClient, rawData json.RawMessage) {
+	var syncData sync.SyncData
+	if err := json.Unmarshal(rawData, &syncData); err != nil {
+		slog.Error("invalid sync data", "error", err)
 		return
 	}
 
-	isBinary := isBinaryContent(msg.Path, msg.Content)
-	f, err := h.vaults.PutFile(sender.hub.vaultID, msg.Path, msg.Content, isBinary)
-	if err != nil {
-		slog.Error("sync put_file failed", "error", err)
+	vaultID := sender.hub.vaultID
+
+	// Apply the incoming sync message to the document
+	if err := h.engine.ReceiveSyncMessage(vaultID, sender.syncState, syncData.Message); err != nil {
+		slog.Error("receive sync message failed", "vault", vaultID, "error", err)
 		return
 	}
 
-	// Broadcast to other clients
-	notification, _ := json.Marshal(syncMessage{
-		Type: "file_changed",
-		Data: rawJSON(mustMarshal(map[string]interface{}{
-			"path": f.Path,
-			"hash": f.Hash,
-			"size": f.Size,
-		})),
-	})
+	// Generate response sync messages for the sender
+	h.sendPendingSyncMessages(sender)
 
+	// Materialize changes to vault_files (async)
+	go func() {
+		if err := h.engine.MaterializeFiles(vaultID); err != nil {
+			slog.Error("materialize files failed", "vault", vaultID, "error", err)
+		}
+	}()
+
+	// Broadcast to other connected clients: generate sync messages for each
 	sender.hub.mu.RLock()
+	peers := make([]*SyncClient, 0, len(sender.hub.clients))
 	for client := range sender.hub.clients {
 		if client != sender {
-			select {
-			case client.send <- notification:
-			default:
-				// Client buffer full, skip
-			}
+			peers = append(peers, client)
 		}
 	}
 	sender.hub.mu.RUnlock()
+
+	for _, peer := range peers {
+		h.sendPendingSyncMessages(peer)
+	}
 }
 
-func (h *SyncHandler) handleDeleteFile(sender *SyncClient, data json.RawMessage) {
-	var msg deleteFileMessage
-	if err := json.Unmarshal(data, &msg); err != nil {
-		return
-	}
-
-	if err := h.vaults.DeleteFile(sender.hub.vaultID, msg.Path); err != nil {
-		slog.Error("sync delete_file failed", "error", err)
-		return
-	}
-
-	notification, _ := json.Marshal(syncMessage{
-		Type: "file_deleted",
-		Data: rawJSON(mustMarshal(map[string]string{"path": msg.Path})),
-	})
-
-	sender.hub.mu.RLock()
-	for client := range sender.hub.clients {
-		if client != sender {
-			select {
-			case client.send <- notification:
-			default:
-			}
-		}
-	}
-	sender.hub.mu.RUnlock()
-}
-
-func rawJSON(s string) json.RawMessage {
-	return json.RawMessage(s)
-}
-
-func mustMarshal(v interface{}) string {
-	b, _ := json.Marshal(v)
-	return string(b)
+func sendError(conn *websocket.Conn, message string) {
+	data, _ := json.Marshal(sync.ErrorData{Message: message})
+	conn.WriteJSON(sync.WireMessage{Type: sync.MsgTypeError, Data: data})
 }

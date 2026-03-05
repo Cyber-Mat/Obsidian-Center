@@ -4,15 +4,16 @@ import (
 	"net/http"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
+	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 )
 
-func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.SessionStore, vaults *vault.Store) http.Handler {
+func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.SessionStore, vaults *vault.Store, engine *sync.Engine) http.Handler {
 	mux := http.NewServeMux()
 
 	authHandler := &AuthHandler{jwt: jwt, users: users, sessions: sessions}
 	vaultHandler := &VaultHandler{vaults: vaults}
-	syncHandler := &SyncHandler{vaults: vaults, jwt: jwt}
+	syncHandler := NewSyncHandler(vaults, jwt, engine)
 
 	// Health check (public, used by Docker healthcheck)
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {

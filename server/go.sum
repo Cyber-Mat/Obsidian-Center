@@ -1,3 +1,5 @@
+github.com/automerge/automerge-go v0.0.0-20241030180337-6fb4f2d08244 h1:zzw/8zTEZKROqQe9HzRyEin/ylr96Yy5th6Ej4Mxp20=
+github.com/automerge/automerge-go v0.0.0-20241030180337-6fb4f2d08244/go.mod h1:6UxoDE+thWsISXK93pxaOuOfkcAfCvDbg0eAnFmxL5E=
 github.com/golang-jwt/jwt/v5 v5.3.1 h1:kYf81DTWFe7t+1VvL7eS+jKFVWaUnK9cB1qbwn63YCY=
 github.com/golang-jwt/jwt/v5 v5.3.1/go.mod h1:fxCRLWMO43lRc8nhHWY6LGqRcf+1gQWArsqaEUEa5bE=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=

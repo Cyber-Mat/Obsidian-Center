@@ -211,3 +211,87 @@ func (s *Store) Snapshot(vaultID string) (map[string]string, error) {
 	}
 	return snapshot, rows.Err()
 }
+
+// CRDT state operations
+
+// GetCRDTState returns the raw Automerge document bytes for a vault.
+func (s *Store) GetCRDTState(vaultID string) ([]byte, error) {
+	var data []byte
+	err := s.db.QueryRow("SELECT crdt_state FROM vaults WHERE id = ?", vaultID).Scan(&data)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get CRDT state: %w", err)
+	}
+	return data, nil
+}
+
+// SaveCRDTState persists the Automerge document bytes for a vault.
+func (s *Store) SaveCRDTState(vaultID string, data []byte) error {
+	_, err := s.db.Exec("UPDATE vaults SET crdt_state = ?, updated_at = ? WHERE id = ?",
+		data, time.Now(), vaultID)
+	if err != nil {
+		return fmt.Errorf("save CRDT state: %w", err)
+	}
+	return nil
+}
+
+// ListFilesRaw returns all file paths, hashes, and content for bootstrapping CRDT.
+func (s *Store) ListFilesRaw(vaultID string) ([]struct {
+	Path    string
+	Hash    string
+	Content []byte
+}, error) {
+	rows, err := s.db.Query("SELECT path, hash, content FROM vault_files WHERE vault_id = ?", vaultID)
+	if err != nil {
+		return nil, fmt.Errorf("list files raw: %w", err)
+	}
+	defer rows.Close()
+
+	var files []struct {
+		Path    string
+		Hash    string
+		Content []byte
+	}
+	for rows.Next() {
+		var f struct {
+			Path    string
+			Hash    string
+			Content []byte
+		}
+		if err := rows.Scan(&f.Path, &f.Hash, &f.Content); err != nil {
+			return nil, fmt.Errorf("scan file raw: %w", err)
+		}
+		files = append(files, f)
+	}
+	return files, rows.Err()
+}
+
+// UpsertFileFromCRDT writes a file from CRDT materialization (no hash recompute).
+func (s *Store) UpsertFileFromCRDT(vaultID, path string, content []byte, hash string, isBinary bool) error {
+	now := time.Now()
+	_, err := s.db.Exec(`
+		INSERT INTO vault_files (vault_id, path, content, hash, size, is_binary, created_at, modified_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(vault_id, path) DO UPDATE SET
+			content = excluded.content,
+			hash = excluded.hash,
+			size = excluded.size,
+			is_binary = excluded.is_binary,
+			modified_at = excluded.modified_at
+	`, vaultID, path, content, hash, len(content), isBinary, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert file from CRDT: %w", err)
+	}
+	return nil
+}
+
+// DeleteFileRecord removes a file from vault_files.
+func (s *Store) DeleteFileRecord(vaultID, path string) error {
+	_, err := s.db.Exec("DELETE FROM vault_files WHERE vault_id = ? AND path = ?", vaultID, path)
+	if err != nil {
+		return fmt.Errorf("delete file record: %w", err)
+	}
+	return nil
+}

@@ -12,5 +12,8 @@
     "esbuild": "^0.21.0",
     "obsidian": "^1.5.0",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@automerge/automerge": "^3.2.4"
   }
 }

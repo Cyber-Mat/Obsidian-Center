@@ -1,15 +1,22 @@
 import { Notice, Plugin, TFile, TAbstractFile } from "obsidian";
 import { ObsidianCenterSettings, DEFAULT_SETTINGS, SettingsTab } from "./settings";
 import { SyncClient } from "./sync/client";
+import { CRDTManager } from "./sync/crdt";
+import type { Patch } from "@automerge/automerge";
+
+const CRDT_SAVE_KEY = "crdt-state";
 
 export default class ObsidianCenterPlugin extends Plugin {
 	settings: ObsidianCenterSettings = DEFAULT_SETTINGS;
 	syncClient: SyncClient | null = null;
-	private pendingChanges: Map<string, NodeJS.Timeout> = new Map();
-	private isSyncing = false;
+	crdt: CRDTManager = new CRDTManager();
+	private pendingChanges: Map<string, ReturnType<typeof setTimeout>> = new Map();
+	private isApplyingRemote = false;
+	private saveTimer: ReturnType<typeof setTimeout> | null = null;
 
 	async onload() {
 		await this.loadSettings();
+		await this.loadCRDTState();
 		this.addSettingTab(new SettingsTab(this.app, this));
 
 		this.addCommand({
@@ -49,6 +56,7 @@ export default class ObsidianCenterPlugin extends Plugin {
 
 	async onunload() {
 		this.disconnect();
+		await this.saveCRDTState();
 	}
 
 	async loadSettings() {
@@ -57,6 +65,39 @@ export default class ObsidianCenterPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	private async loadCRDTState() {
+		try {
+			const adapter = this.app.vault.adapter;
+			const crdtPath = `${this.manifest.dir}/${CRDT_SAVE_KEY}.bin`;
+			if (await adapter.exists(crdtPath)) {
+				const data = await adapter.readBinary(crdtPath);
+				this.crdt.load(new Uint8Array(data));
+				console.log("OC: loaded CRDT state from disk");
+			}
+		} catch (e) {
+			console.warn("OC: failed to load CRDT state, starting fresh:", e);
+			this.crdt = new CRDTManager();
+		}
+	}
+
+	private async saveCRDTState() {
+		try {
+			const data = this.crdt.save();
+			const adapter = this.app.vault.adapter;
+			const crdtPath = `${this.manifest.dir}/${CRDT_SAVE_KEY}.bin`;
+			await adapter.writeBinary(crdtPath, data.buffer as ArrayBuffer);
+		} catch (e) {
+			console.error("OC: failed to save CRDT state:", e);
+		}
+	}
+
+	private scheduleCRDTSave() {
+		if (this.saveTimer) clearTimeout(this.saveTimer);
+		this.saveTimer = setTimeout(() => {
+			this.saveCRDTState();
+		}, 5000);
 	}
 
 	async connect() {
@@ -74,9 +115,9 @@ export default class ObsidianCenterPlugin extends Plugin {
 				this.settings.serverUrl,
 				this.settings.vaultId,
 				this.settings.accessToken,
+				this.crdt,
 				{
-					onFileChanged: (path, hash) => this.onRemoteFileChanged(path, hash),
-					onFileDeleted: (path) => this.onRemoteFileDeleted(path),
+					onPatchesApplied: (patches) => this.onRemotePatches(patches),
 					onConnected: () => this.updateStatus("connected"),
 					onDisconnected: () => this.updateStatus("disconnected"),
 					onError: (err) => {
@@ -100,98 +141,124 @@ export default class ObsidianCenterPlugin extends Plugin {
 	}
 
 	private updateStatus(status: string) {
-		// Update all status bar items created by this plugin
-		const el = this.app.workspace.containerEl.querySelector(
-			".status-bar-item"
-		);
-		if (el) {
-			// We'll use the simple approach of just updating via Notice for now
-		}
+		// Status bar items are managed by Obsidian framework
 	}
 
-	// Local file changes — debounced to avoid flooding during rapid edits
+	// --- Local file changes → CRDT → sync ---
+
 	private onFileChange(file: TAbstractFile) {
-		if (!(file instanceof TFile) || this.isSyncing) return;
+		if (!(file instanceof TFile) || this.isApplyingRemote) return;
 
 		const existing = this.pendingChanges.get(file.path);
 		if (existing) clearTimeout(existing);
 
 		const timeout = setTimeout(() => {
 			this.pendingChanges.delete(file.path);
-			this.syncFileToServer(file as TFile);
+			this.syncFileLocally(file as TFile);
 		}, this.settings.debounceMs);
 
 		this.pendingChanges.set(file.path, timeout);
 	}
 
 	private onFileDelete(file: TAbstractFile) {
-		if (this.isSyncing) return;
-		this.syncClient?.deleteFile(file.path);
+		if (this.isApplyingRemote) return;
+
+		this.crdt.deleteFile(file.path);
+		this.syncClient?.pushChanges();
+		this.scheduleCRDTSave();
 	}
 
 	private onFileRename(file: TAbstractFile, oldPath: string) {
-		if (this.isSyncing) return;
+		if (this.isApplyingRemote) return;
+
 		// Rename = delete old + create new
-		this.syncClient?.deleteFile(oldPath);
+		this.crdt.deleteFile(oldPath);
 		if (file instanceof TFile) {
-			this.syncFileToServer(file);
+			this.syncFileLocally(file);
+		} else {
+			this.syncClient?.pushChanges();
 		}
+		this.scheduleCRDTSave();
 	}
 
-	private async syncFileToServer(file: TFile) {
-		if (!this.syncClient) return;
-
+	private async syncFileLocally(file: TFile) {
 		try {
 			const content = await this.app.vault.readBinary(file);
-			this.syncClient.putFile(file.path, new Uint8Array(content));
+			const data = new Uint8Array(content);
+			const isBinary = this.isBinaryFile(file.path, data);
+
+			this.crdt.putFile(file.path, data, isBinary);
+			this.syncClient?.pushChanges();
+			this.scheduleCRDTSave();
 		} catch (e) {
-			console.error(`OC: failed to sync ${file.path}:`, e);
+			console.error(`OC: failed to sync ${file.path} locally:`, e);
 		}
 	}
 
-	// Remote changes — apply to local vault
-	private async onRemoteFileChanged(path: string, hash: string) {
-		if (!this.syncClient) return;
+	// --- Remote patches → local vault ---
 
-		// Check if local file already matches
-		const existing = this.app.vault.getAbstractFileByPath(path);
-		if (existing instanceof TFile) {
-			const content = await this.app.vault.readBinary(existing);
-			const localHash = await this.hashContent(new Uint8Array(content));
-			if (localHash === hash) return; // Already in sync
+	private async onRemotePatches(patches: Patch[]) {
+		// Determine which file paths were affected
+		const affectedPaths = new Set<string>();
+		const deletedPaths = new Set<string>();
+
+		for (const patch of patches) {
+			if (patch.path.length >= 2 && patch.path[0] === "files") {
+				const filePath = patch.path[1] as string;
+				if (patch.action === "del" && patch.path.length === 2) {
+					deletedPaths.add(filePath);
+				} else {
+					affectedPaths.add(filePath);
+				}
+			}
 		}
 
+		this.isApplyingRemote = true;
 		try {
-			this.isSyncing = true;
-			const content = await this.syncClient.getFile(path);
-			if (!content) return;
+			// Handle deletions
+			for (const path of deletedPaths) {
+				const file = this.app.vault.getAbstractFileByPath(path);
+				if (file) {
+					await this.app.vault.delete(file);
+				}
+			}
 
-			const existingFile = this.app.vault.getAbstractFileByPath(path);
-			if (existingFile instanceof TFile) {
-				await this.app.vault.modifyBinary(existingFile, content.buffer as ArrayBuffer);
-			} else {
-				await this.app.vault.createBinary(path, content.buffer as ArrayBuffer);
+			// Handle creates/updates
+			for (const path of affectedPaths) {
+				if (deletedPaths.has(path)) continue;
+
+				const content = this.crdt.getFileContent(path);
+				if (!content) continue;
+
+				const existingFile = this.app.vault.getAbstractFileByPath(path);
+				if (existingFile instanceof TFile) {
+					// Check if content actually changed
+					const localContent = await this.app.vault.readBinary(existingFile);
+					if (!arraysEqual(new Uint8Array(localContent), content)) {
+						await this.app.vault.modifyBinary(
+							existingFile,
+							content.buffer as ArrayBuffer
+						);
+					}
+				} else {
+					// Ensure parent directories exist
+					const dir = path.substring(0, path.lastIndexOf("/"));
+					if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
+						await this.app.vault.createFolder(dir);
+					}
+					await this.app.vault.createBinary(path, content.buffer as ArrayBuffer);
+				}
 			}
 		} catch (e) {
-			console.error(`OC: failed to apply remote change for ${path}:`, e);
+			console.error("OC: failed to apply remote patches:", e);
 		} finally {
-			this.isSyncing = false;
+			this.isApplyingRemote = false;
 		}
+
+		this.scheduleCRDTSave();
 	}
 
-	private async onRemoteFileDeleted(path: string) {
-		try {
-			this.isSyncing = true;
-			const file = this.app.vault.getAbstractFileByPath(path);
-			if (file) {
-				await this.app.vault.delete(file);
-			}
-		} catch (e) {
-			console.error(`OC: failed to delete ${path}:`, e);
-		} finally {
-			this.isSyncing = false;
-		}
-	}
+	// --- Manual sync command ---
 
 	async triggerSync() {
 		if (!this.syncClient) {
@@ -202,36 +269,51 @@ export default class ObsidianCenterPlugin extends Plugin {
 		new Notice("Obsidian Center: syncing...");
 
 		try {
-			const snapshot = await this.syncClient.getSnapshot();
+			// Push all local files into CRDT
 			const localFiles = this.app.vault.getFiles();
-
-			// Upload files that differ or are missing on server
 			for (const file of localFiles) {
 				const content = await this.app.vault.readBinary(file);
-				const hash = await this.hashContent(new Uint8Array(content));
+				const data = new Uint8Array(content);
+				const isBinary = this.isBinaryFile(file.path, data);
 
-				if (snapshot[file.path] !== hash) {
-					await this.syncFileToServer(file);
+				// Only update if not already tracked
+				const existingHash = this.crdt.getFileHash(file.path);
+				if (!existingHash) {
+					this.crdt.putFile(file.path, data, isBinary);
 				}
 			}
 
-			// Download files that exist on server but not locally
-			for (const [path, hash] of Object.entries(snapshot)) {
-				const local = this.app.vault.getAbstractFileByPath(path);
-				if (!local) {
-					await this.onRemoteFileChanged(path, hash);
-				}
-			}
+			// Push changes to server
+			this.syncClient.pushChanges();
+			this.scheduleCRDTSave();
 
-			new Notice("Obsidian Center: sync complete");
+			new Notice("Obsidian Center: sync initiated");
 		} catch (e) {
 			new Notice(`Obsidian Center: sync failed - ${e}`);
 		}
 	}
 
-	private async hashContent(data: Uint8Array): Promise<string> {
-		const hashBuffer = await crypto.subtle.digest("SHA-256", data);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+	private isBinaryFile(path: string, content: Uint8Array): boolean {
+		const binaryExts = [
+			".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf",
+			".zip", ".tar", ".gz", ".mp3", ".mp4", ".wav", ".ogg",
+		];
+		const lower = path.toLowerCase();
+		for (const ext of binaryExts) {
+			if (lower.endsWith(ext)) return true;
+		}
+		const check = content.subarray(0, Math.min(content.length, 512));
+		for (let i = 0; i < check.length; i++) {
+			if (check[i] === 0) return true;
+		}
+		return false;
 	}
+}
+
+function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
 }

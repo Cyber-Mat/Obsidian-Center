@@ -13,6 +13,7 @@ import (
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/api"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
+	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 )
 
@@ -57,7 +58,11 @@ func main() {
 	sessionStore := auth.NewSessionStore(db)
 	vaultStore := vault.NewStore(db)
 
-	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore)
+	// Initialize CRDT sync engine
+	storeAdapter := sync.NewStoreAdapter(vaultStore)
+	syncEngine := sync.NewEngine(storeAdapter)
+
+	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore, syncEngine)
 
 	srv := &http.Server{
 		Addr:         cfg.Addr,
@@ -80,6 +85,9 @@ func main() {
 
 	<-done
 	slog.Info("shutting down")
+
+	// Persist all CRDT state before exit
+	syncEngine.Shutdown()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
