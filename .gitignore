@@ -1,0 +1,9 @@
+bin/
+*.db
+*.db-wal
+*.db-shm
+node_modules/
+plugin/main.js
+plugin/main.js.map
+.air.toml
+server/server

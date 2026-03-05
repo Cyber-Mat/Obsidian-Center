@@ -1,0 +1,9 @@
+{
+  "id": "obsidian-center",
+  "name": "Obsidian Center",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Sync your vault with an Obsidian Center server for cross-device access, collaboration, and AI-powered features.",
+  "author": "Cyber-Mat",
+  "isDesktopOnly": false
+}
