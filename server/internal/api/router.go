@@ -14,6 +14,11 @@ func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.Sessi
 	vaultHandler := &VaultHandler{vaults: vaults}
 	syncHandler := &SyncHandler{vaults: vaults, jwt: jwt}
 
+	// Health check (public, used by Docker healthcheck)
+	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+
 	// Public routes
 	mux.HandleFunc("POST /api/auth/register", authHandler.Register)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)

@@ -1,0 +1,19 @@
+services:
+  server:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - oc-data:/data
+    environment:
+      OC_JWT_SECRET: "${OC_JWT_SECRET:?Set OC_JWT_SECRET in .env or environment}"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  oc-data:
