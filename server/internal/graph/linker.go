@@ -24,23 +24,63 @@ type Link struct {
 //	![[target|display text]]
 var wikiLinkRe = regexp.MustCompile(`(!?)\[\[([^\[\]]+?)\]\]`)
 
+// codeBlockRe matches fenced code blocks (``` or ~~~).
+var codeBlockRe = regexp.MustCompile("(?m)^(```|~~~).*$")
+
+// inlineCodeRe matches inline code spans.
+var inlineCodeRe = regexp.MustCompile("`[^`]+`")
+
 // ParseLinks extracts all wiki-links from markdown content.
 // It returns the links found with their resolved target paths.
 // existingPaths is used to resolve ambiguous links (basename matching).
+// Links inside code blocks and inline code are skipped.
 func ParseLinks(content string, existingPaths []string) []Link {
+	excluded := buildExcludedRanges(content)
 	matches := wikiLinkRe.FindAllStringSubmatchIndex(content, -1)
 	links := make([]Link, 0, len(matches))
 
 	for _, match := range matches {
+		position := match[0]
+		if isInRange(position, excluded) {
+			continue
+		}
+
 		isEmbed := content[match[2]:match[3]] == "!"
 		inner := content[match[4]:match[5]]
-		position := match[0]
 
 		link := parseInner(inner, isEmbed, position, existingPaths)
 		links = append(links, link)
 	}
 
 	return links
+}
+
+// buildExcludedRanges returns byte ranges that should be excluded from
+// link parsing (fenced code blocks and inline code spans).
+func buildExcludedRanges(content string) [][2]int {
+	var ranges [][2]int
+
+	// Find fenced code blocks
+	fenceMatches := codeBlockRe.FindAllStringIndex(content, -1)
+	for i := 0; i+1 < len(fenceMatches); i += 2 {
+		ranges = append(ranges, [2]int{fenceMatches[i][0], fenceMatches[i+1][1]})
+	}
+
+	// Find inline code
+	for _, m := range inlineCodeRe.FindAllStringIndex(content, -1) {
+		ranges = append(ranges, [2]int{m[0], m[1]})
+	}
+
+	return ranges
+}
+
+func isInRange(pos int, ranges [][2]int) bool {
+	for _, r := range ranges {
+		if pos >= r[0] && pos < r[1] {
+			return true
+		}
+	}
+	return false
 }
 
 // parseInner parses the inner content of a wiki-link (between [[ and ]]).

@@ -223,6 +223,14 @@ func (e *Engine) GenerateSyncMessage(syncState *automerge.SyncState) ([]byte, bo
 	return msg.Bytes(), true
 }
 
+// fileSnapshot holds a consistent snapshot of a file's state from the CRDT doc.
+type fileSnapshot struct {
+	Path     string
+	Hash     string
+	Content  []byte
+	IsBinary bool
+}
+
 // MaterializeFiles syncs the CRDT document state to the vault_files table
 // and re-indexes wiki-links for markdown files.
 func (e *Engine) MaterializeFiles(vaultID string) error {
@@ -233,37 +241,44 @@ func (e *Engine) MaterializeFiles(vaultID string) error {
 		return fmt.Errorf("vault not loaded: %s", vaultID)
 	}
 
+	// Snapshot all file data under a single lock to avoid race conditions
 	vs.mu.Lock()
 	infos, err := vs.doc.ListFiles()
-	vs.mu.Unlock()
 	if err != nil {
+		vs.mu.Unlock()
 		return err
 	}
 
-	// Collect all file paths for link resolution
+	snapshots := make([]fileSnapshot, 0, len(infos))
 	allPaths := make([]string, 0, len(infos))
 	for _, info := range infos {
 		allPaths = append(allPaths, info.Path)
-	}
-
-	for _, info := range infos {
-		vs.mu.Lock()
-		content, isBinary, err := vs.doc.ReadFile(info.Path)
-		vs.mu.Unlock()
-		if err != nil {
-			slog.Error("materialize read failed", "path", info.Path, "error", err)
+		content, isBinary, readErr := vs.doc.ReadFile(info.Path)
+		if readErr != nil {
+			slog.Error("materialize read failed", "path", info.Path, "error", readErr)
 			continue
 		}
-		if err := e.store.UpsertFileFromCRDT(vaultID, info.Path, content, info.Hash, isBinary); err != nil {
-			slog.Error("materialize upsert failed", "path", info.Path, "error", err)
+		snapshots = append(snapshots, fileSnapshot{
+			Path:     info.Path,
+			Hash:     info.Hash,
+			Content:  content,
+			IsBinary: isBinary,
+		})
+	}
+	vs.mu.Unlock()
+
+	// Write to DB outside the lock
+	for _, snap := range snapshots {
+		if err := e.store.UpsertFileFromCRDT(vaultID, snap.Path, snap.Content, snap.Hash, snap.IsBinary); err != nil {
+			slog.Error("materialize upsert failed", "path", snap.Path, "error", err)
 			continue
 		}
 
 		// Re-index links for markdown files
-		if e.graphs != nil && !isBinary && isMarkdown(info.Path) {
-			links := graph.ParseLinks(string(content), allPaths)
-			if err := e.graphs.UpdateLinks(vaultID, info.Path, links); err != nil {
-				slog.Error("link index failed", "path", info.Path, "error", err)
+		if e.graphs != nil && !snap.IsBinary && isMarkdown(snap.Path) {
+			links := graph.ParseLinks(string(snap.Content), allPaths)
+			if err := e.graphs.UpdateLinks(vaultID, snap.Path, links); err != nil {
+				slog.Error("link index failed", "path", snap.Path, "error", err)
 			}
 		}
 	}

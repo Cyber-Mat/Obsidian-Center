@@ -169,8 +169,8 @@ export class SettingsTab extends PluginSettingTab {
 			);
 
 			if (!resp.ok) {
-				const err = await resp.json();
-				new Notice(`Login failed: ${err.error}`);
+				const msg = await safeErrorMessage(resp);
+				new Notice(`Login failed: ${msg}`);
 				return;
 			}
 
@@ -197,8 +197,8 @@ export class SettingsTab extends PluginSettingTab {
 			);
 
 			if (!resp.ok) {
-				const err = await resp.json();
-				new Notice(`Registration failed: ${err.error}`);
+				const msg = await safeErrorMessage(resp);
+				new Notice(`Registration failed: ${msg}`);
 				return;
 			}
 
@@ -229,8 +229,8 @@ export class SettingsTab extends PluginSettingTab {
 			);
 
 			if (!resp.ok) {
-				const err = await resp.json();
-				new Notice(`Create vault failed: ${err.error}`);
+				const msg = await safeErrorMessage(resp);
+				new Notice(`Create vault failed: ${msg}`);
 				return;
 			}
 
@@ -242,5 +242,14 @@ export class SettingsTab extends PluginSettingTab {
 		} catch (e) {
 			new Notice(`Create vault failed: ${e}`);
 		}
+	}
+}
+
+async function safeErrorMessage(resp: Response): Promise<string> {
+	try {
+		const body = await resp.json();
+		return body.error || resp.statusText;
+	} catch {
+		return resp.statusText || `HTTP ${resp.status}`;
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
 	gosync "sync"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
@@ -16,7 +17,17 @@ import (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true }, // TODO: tighten in production
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // non-browser clients (CLI, Obsidian plugin)
+		}
+		u, err := url.Parse(origin)
+		if err != nil {
+			return false
+		}
+		return u.Host == r.Host
+	},
 }
 
 // SyncHandler manages WebSocket connections for CRDT sync.
@@ -152,14 +163,18 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	slog.Info("sync client connected", "vault", vaultID, "user", userID)
 
 	// Generate initial sync messages to bring client up to date
-	h.sendPendingSyncMessages(client)
+	if !h.sendPendingSyncMessages(client) {
+		conn.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump(h)
 }
 
 // sendPendingSyncMessages generates and queues all pending sync messages for a client.
-func (h *SyncHandler) sendPendingSyncMessages(client *SyncClient) {
+// Returns false if the client's send buffer overflowed and it should be disconnected.
+func (h *SyncHandler) sendPendingSyncMessages(client *SyncClient) bool {
 	for {
 		msgBytes, valid := h.engine.GenerateSyncMessage(client.syncState)
 		if !valid {
@@ -170,10 +185,12 @@ func (h *SyncHandler) sendPendingSyncMessages(client *SyncClient) {
 		select {
 		case client.send <- wireMsg:
 		default:
-			slog.Warn("client send buffer full during initial sync", "vault", client.hub.vaultID)
-			return
+			slog.Warn("client send buffer full, disconnecting", "vault", client.hub.vaultID)
+			close(client.send)
+			return false
 		}
 	}
+	return true
 }
 
 func (c *SyncClient) readPump(h *SyncHandler) {
@@ -235,12 +252,10 @@ func (h *SyncHandler) handleSyncMessage(sender *SyncClient, rawData json.RawMess
 	// Generate response sync messages for the sender
 	h.sendPendingSyncMessages(sender)
 
-	// Materialize changes to vault_files (async)
-	go func() {
-		if err := h.engine.MaterializeFiles(vaultID); err != nil {
-			slog.Error("materialize files failed", "vault", vaultID, "error", err)
-		}
-	}()
+	// Materialize changes to vault_files
+	if err := h.engine.MaterializeFiles(vaultID); err != nil {
+		slog.Error("materialize files failed", "vault", vaultID, "error", err)
+	}
 
 	// Broadcast to other connected clients: generate sync messages for each
 	sender.hub.mu.RLock()

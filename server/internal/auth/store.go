@@ -39,7 +39,10 @@ func (s *UserStore) Create(username, password string) (*User, error) {
 		return nil, fmt.Errorf("insert user: %w", err)
 	}
 
-	id, _ := result.LastInsertId()
+	id, err := result.LastInsertId()
+	if err != nil {
+		return nil, fmt.Errorf("get last insert id: %w", err)
+	}
 	return &User{ID: id, Username: username, CreatedAt: time.Now()}, nil
 }
 
@@ -149,7 +152,18 @@ func NewSessionStore(db *sql.DB) *SessionStore {
 	return &SessionStore{db: db}
 }
 
+const maxSessionsPerUser = 10
+
 func (s *SessionStore) Create(userID int64) (sessionID, refreshToken string, err error) {
+	// Enforce session limit: delete oldest sessions beyond the limit
+	_, _ = s.db.Exec(`
+		DELETE FROM sessions WHERE id IN (
+			SELECT id FROM sessions WHERE user_id = ?
+			ORDER BY created_at DESC
+			LIMIT -1 OFFSET ?
+		)
+	`, userID, maxSessionsPerUser-1)
+
 	sessionID = generateID()
 	refreshToken = generateID() + generateID()
 
@@ -186,7 +200,7 @@ func (s *SessionStore) ValidateRefresh(refreshToken string) (*Session, error) {
 	}
 
 	if time.Now().After(session.ExpiresAt) {
-		s.db.Exec("DELETE FROM sessions WHERE id = ?", session.ID)
+		_, _ = s.db.Exec("DELETE FROM sessions WHERE id = ?", session.ID)
 		return nil, fmt.Errorf("refresh token expired")
 	}
 

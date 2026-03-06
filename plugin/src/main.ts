@@ -13,6 +13,7 @@ export default class ObsidianCenterPlugin extends Plugin {
 	private pendingChanges: Map<string, ReturnType<typeof setTimeout>> = new Map();
 	private isApplyingRemote = false;
 	private saveTimer: ReturnType<typeof setTimeout> | null = null;
+	private statusBarEl: HTMLElement | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -46,7 +47,8 @@ export default class ObsidianCenterPlugin extends Plugin {
 		);
 
 		// Status bar
-		this.addStatusBarItem().setText("OC: disconnected");
+		this.statusBarEl = this.addStatusBarItem();
+		this.updateStatus("disconnected");
 
 		// Auto-connect if configured
 		if (this.settings.serverUrl && this.settings.accessToken) {
@@ -87,7 +89,7 @@ export default class ObsidianCenterPlugin extends Plugin {
 			const data = this.crdt.save();
 			const adapter = this.app.vault.adapter;
 			const crdtPath = `${this.manifest.dir}/${CRDT_SAVE_KEY}.bin`;
-			await adapter.writeBinary(crdtPath, data.buffer as ArrayBuffer);
+			await adapter.writeBinary(crdtPath, toArrayBuffer(data));
 		} catch (e) {
 			console.error("OC: failed to save CRDT state:", e);
 		}
@@ -141,7 +143,14 @@ export default class ObsidianCenterPlugin extends Plugin {
 	}
 
 	private updateStatus(status: string) {
-		// Status bar items are managed by Obsidian framework
+		if (!this.statusBarEl) return;
+		const labels: Record<string, string> = {
+			connected: "OC: connected",
+			disconnected: "OC: disconnected",
+			error: "OC: error",
+			syncing: "OC: syncing...",
+		};
+		this.statusBarEl.setText(labels[status] || `OC: ${status}`);
 	}
 
 	// --- Local file changes → CRDT → sync ---
@@ -230,15 +239,13 @@ export default class ObsidianCenterPlugin extends Plugin {
 				const content = this.crdt.getFileContent(path);
 				if (!content) continue;
 
+				const buf = toArrayBuffer(content);
 				const existingFile = this.app.vault.getAbstractFileByPath(path);
 				if (existingFile instanceof TFile) {
 					// Check if content actually changed
 					const localContent = await this.app.vault.readBinary(existingFile);
 					if (!arraysEqual(new Uint8Array(localContent), content)) {
-						await this.app.vault.modifyBinary(
-							existingFile,
-							content.buffer as ArrayBuffer
-						);
+						await this.app.vault.modifyBinary(existingFile, buf);
 					}
 				} else {
 					// Ensure parent directories exist
@@ -246,7 +253,7 @@ export default class ObsidianCenterPlugin extends Plugin {
 					if (dir && !this.app.vault.getAbstractFileByPath(dir)) {
 						await this.app.vault.createFolder(dir);
 					}
-					await this.app.vault.createBinary(path, content.buffer as ArrayBuffer);
+					await this.app.vault.createBinary(path, buf);
 				}
 			}
 		} catch (e) {
@@ -308,6 +315,14 @@ export default class ObsidianCenterPlugin extends Plugin {
 		}
 		return false;
 	}
+}
+
+/**
+ * Safely convert Uint8Array to ArrayBuffer, handling cases where the
+ * typed array's buffer may be larger than its view (e.g. shared buffers).
+ */
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+	return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
 }
 
 function arraysEqual(a: Uint8Array, b: Uint8Array): boolean {

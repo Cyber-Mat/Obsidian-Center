@@ -5,6 +5,7 @@ import type { Doc, SyncState, Patch } from "@automerge/automerge";
  * Shape of the CRDT vault document.
  */
 export interface VaultDocType {
+	[key: string]: unknown;
 	files: Record<
 		string,
 		{
@@ -57,9 +58,9 @@ export class CRDTManager {
 	 * Update or create a file in the CRDT document.
 	 */
 	putFile(path: string, content: Uint8Array, isBinary: boolean): void {
-		const hash = this.sha256Hex(content);
+		const hash = this.contentHash(content);
 		const textContent = isBinary
-			? btoa(String.fromCharCode(...content))
+			? uint8ArrayToBase64(content)
 			: new TextDecoder().decode(content);
 
 		this.doc = Automerge.change(this.doc, `update ${path}`, (d) => {
@@ -195,20 +196,29 @@ export class CRDTManager {
 	}
 
 	/**
-	 * Compute SHA-256 hex string synchronously using SubtleCrypto isn't
-	 * available synchronously, so we use a simple hash for the CRDT metadata.
-	 * The server computes the real SHA-256; this is just for quick comparison.
+	 * Compute a fast content hash for local change detection.
+	 * Uses FNV-1a — the authoritative SHA-256 hash is computed server-side.
 	 */
-	private sha256Hex(data: Uint8Array): string {
-		// Simple FNV-1a based hash for local comparison.
-		// The authoritative hash is computed server-side.
+	private contentHash(data: Uint8Array): string {
 		let h = 0x811c9dc5;
 		for (let i = 0; i < data.length; i++) {
 			h ^= data[i];
 			h = Math.imul(h, 0x01000193);
 		}
-		// Also include length to reduce collisions
 		const prefix = (h >>> 0).toString(16).padStart(8, "0");
 		return `fnv:${prefix}:${data.length}`;
 	}
+}
+
+/**
+ * Encode Uint8Array to base64 without stack overflow for large files.
+ */
+function uint8ArrayToBase64(bytes: Uint8Array): string {
+	const chunkSize = 8192;
+	let binary = "";
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+		binary += String.fromCharCode(...chunk);
+	}
+	return btoa(binary);
 }

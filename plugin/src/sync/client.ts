@@ -17,6 +17,8 @@ interface SyncData {
 	message: string; // base64-encoded Automerge sync message
 }
 
+const MAX_RECONNECT_ATTEMPTS = 20;
+
 /**
  * SyncClient manages the WebSocket connection to the server and exchanges
  * Automerge sync messages via the CRDTManager.
@@ -33,6 +35,8 @@ export class SyncClient {
 	private maxReconnectDelay = 30000;
 	private shouldReconnect = true;
 	private syncInFlight = false;
+	private reconnectAttempts = 0;
+	private authenticated = false;
 
 	constructor(
 		serverUrl: string,
@@ -50,6 +54,7 @@ export class SyncClient {
 
 	connect(): void {
 		this.shouldReconnect = true;
+		this.reconnectAttempts = 0;
 		this.doConnect();
 	}
 
@@ -81,7 +86,7 @@ export class SyncClient {
 	}
 
 	isConnected(): boolean {
-		return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+		return this.ws !== null && this.ws.readyState === WebSocket.OPEN && this.authenticated;
 	}
 
 	private doConnect(): void {
@@ -89,13 +94,22 @@ export class SyncClient {
 
 		// Reset sync state on new connection so we do a full sync
 		this.crdt.resetSyncState();
+		this.authenticated = false;
 
-		this.ws = new WebSocket(
-			`${wsUrl}/api/sync/${this.vaultId}?token=${encodeURIComponent(this.token)}`
-		);
+		// Connect without token in URL — send auth as first message
+		this.ws = new WebSocket(`${wsUrl}/api/sync/${this.vaultId}`);
 
 		this.ws.onopen = () => {
 			this.reconnectDelay = 1000;
+			this.reconnectAttempts = 0;
+
+			// Send auth as first message instead of URL query param
+			const authMsg: WireMessage = {
+				type: "auth",
+				data: { token: this.token },
+			};
+			this.ws!.send(JSON.stringify(authMsg));
+			this.authenticated = true;
 			this.callbacks.onConnected();
 
 			// Start sync protocol: send our initial sync message
@@ -112,6 +126,7 @@ export class SyncClient {
 		};
 
 		this.ws.onclose = () => {
+			this.authenticated = false;
 			this.callbacks.onDisconnected();
 			this.scheduleReconnect();
 		};
@@ -124,6 +139,14 @@ export class SyncClient {
 	private scheduleReconnect(): void {
 		if (!this.shouldReconnect) return;
 
+		this.reconnectAttempts++;
+		if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+			this.callbacks.onError(
+				new Error(`Reconnection failed after ${MAX_RECONNECT_ATTEMPTS} attempts`)
+			);
+			return;
+		}
+
 		this.reconnectTimer = setTimeout(() => {
 			this.doConnect();
 		}, this.reconnectDelay);
@@ -135,9 +158,12 @@ export class SyncClient {
 	}
 
 	private handleMessage(msg: WireMessage): void {
+		if (!msg || typeof msg.type !== "string") return;
+
 		switch (msg.type) {
 			case "sync": {
 				const data = msg.data as SyncData;
+				if (!data?.message) return;
 				const messageBytes = base64ToUint8Array(data.message);
 
 				const patches = this.crdt.receiveSyncMessage(messageBytes);
@@ -154,7 +180,7 @@ export class SyncClient {
 				break;
 			case "error": {
 				const data = msg.data as { message: string };
-				this.callbacks.onError(new Error(data.message));
+				this.callbacks.onError(new Error(data?.message || "unknown error"));
 				break;
 			}
 		}
@@ -184,9 +210,11 @@ export class SyncClient {
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
+	const chunkSize = 8192;
 	let binary = "";
-	for (let i = 0; i < bytes.length; i++) {
-		binary += String.fromCharCode(bytes[i]);
+	for (let i = 0; i < bytes.length; i += chunkSize) {
+		const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+		binary += String.fromCharCode(...chunk);
 	}
 	return btoa(binary);
 }

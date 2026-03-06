@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
@@ -133,7 +134,9 @@ func (s *Store) PutFile(vaultID, path string, content []byte, isBinary bool) (*F
 	}
 
 	// Update vault timestamp
-	s.db.Exec("UPDATE vaults SET updated_at = ? WHERE id = ?", now, vaultID)
+	if _, err := s.db.Exec("UPDATE vaults SET updated_at = ? WHERE id = ?", now, vaultID); err != nil {
+		slog.Warn("failed to update vault timestamp", "vault", vaultID, "error", err)
+	}
 
 	return &File{
 		VaultID:    vaultID,
