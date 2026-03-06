@@ -13,6 +13,7 @@ import (
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/api"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
+	"github.com/Cyber-Mat/obsidian-center/server/internal/graph"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 )
@@ -58,11 +59,14 @@ func main() {
 	sessionStore := auth.NewSessionStore(db)
 	vaultStore := vault.NewStore(db)
 
-	// Initialize CRDT sync engine
-	storeAdapter := sync.NewStoreAdapter(vaultStore)
-	syncEngine := sync.NewEngine(storeAdapter)
+	// Initialize link graph store
+	graphStore := graph.NewStore(db)
 
-	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore, syncEngine)
+	// Initialize CRDT sync engine with link indexer
+	storeAdapter := sync.NewStoreAdapter(vaultStore)
+	syncEngine := sync.NewEngine(storeAdapter, graphStore)
+
+	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore, syncEngine, graphStore)
 
 	srv := &http.Server{
 		Addr:         cfg.Addr,

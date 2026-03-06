@@ -3,9 +3,11 @@ package sync
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 	gosync "sync"
 	"time"
 
+	"github.com/Cyber-Mat/obsidian-center/server/internal/graph"
 	"github.com/automerge/automerge-go"
 )
 
@@ -27,8 +29,9 @@ type FileRecord struct {
 
 // Engine manages CRDT documents for all vaults.
 type Engine struct {
-	store CRDTStore
-	mu    gosync.Mutex
+	store  CRDTStore
+	graphs *graph.Store
+	mu     gosync.Mutex
 	vaults map[string]*vaultState
 }
 
@@ -40,9 +43,10 @@ type vaultState struct {
 }
 
 // NewEngine creates a sync engine.
-func NewEngine(store CRDTStore) *Engine {
+func NewEngine(store CRDTStore, graphs *graph.Store) *Engine {
 	e := &Engine{
 		store:  store,
+		graphs: graphs,
 		vaults: make(map[string]*vaultState),
 	}
 	go e.persistLoop()
@@ -219,7 +223,8 @@ func (e *Engine) GenerateSyncMessage(syncState *automerge.SyncState) ([]byte, bo
 	return msg.Bytes(), true
 }
 
-// MaterializeFiles syncs the CRDT document state to the vault_files table.
+// MaterializeFiles syncs the CRDT document state to the vault_files table
+// and re-indexes wiki-links for markdown files.
 func (e *Engine) MaterializeFiles(vaultID string) error {
 	e.mu.Lock()
 	vs, ok := e.vaults[vaultID]
@@ -235,6 +240,12 @@ func (e *Engine) MaterializeFiles(vaultID string) error {
 		return err
 	}
 
+	// Collect all file paths for link resolution
+	allPaths := make([]string, 0, len(infos))
+	for _, info := range infos {
+		allPaths = append(allPaths, info.Path)
+	}
+
 	for _, info := range infos {
 		vs.mu.Lock()
 		content, isBinary, err := vs.doc.ReadFile(info.Path)
@@ -245,10 +256,23 @@ func (e *Engine) MaterializeFiles(vaultID string) error {
 		}
 		if err := e.store.UpsertFileFromCRDT(vaultID, info.Path, content, info.Hash, isBinary); err != nil {
 			slog.Error("materialize upsert failed", "path", info.Path, "error", err)
+			continue
+		}
+
+		// Re-index links for markdown files
+		if e.graphs != nil && !isBinary && isMarkdown(info.Path) {
+			links := graph.ParseLinks(string(content), allPaths)
+			if err := e.graphs.UpdateLinks(vaultID, info.Path, links); err != nil {
+				slog.Error("link index failed", "path", info.Path, "error", err)
+			}
 		}
 	}
 
 	return nil
+}
+
+func isMarkdown(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".md")
 }
 
 // Shutdown persists all dirty documents.
