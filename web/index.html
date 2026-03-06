@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Obsidian Center</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <!-- Auth screen -->
+  <div id="auth-screen" class="screen">
+    <div class="auth-container">
+      <h1>Obsidian Center</h1>
+      <form id="auth-form">
+        <input type="text" id="auth-username" placeholder="Username" required autocomplete="username">
+        <input type="password" id="auth-password" placeholder="Password" required autocomplete="current-password">
+        <div class="auth-buttons">
+          <button type="submit" id="btn-login">Log in</button>
+          <button type="button" id="btn-register">Register</button>
+        </div>
+        <p id="auth-error" class="error" hidden></p>
+      </form>
+    </div>
+  </div>
+
+  <!-- Editor screen -->
+  <div id="editor-screen" class="screen" hidden>
+    <header id="toolbar">
+      <span class="toolbar-title">Obsidian Center</span>
+      <span id="sync-status" class="sync-badge">disconnected</span>
+      <span id="current-file" class="current-file"></span>
+      <button id="btn-logout" class="btn-small">Log out</button>
+    </header>
+    <div id="workspace">
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <select id="vault-select"></select>
+          <button id="btn-new-file" class="btn-icon" title="New file">+</button>
+        </div>
+        <div id="file-tree"></div>
+      </aside>
+      <main id="editor-pane">
+        <div id="editor"></div>
+        <div id="empty-state">
+          <p>Select a file from the sidebar to begin editing.</p>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <script type="module" src="/static/dist/app.js"></script>
+</body>
+</html>

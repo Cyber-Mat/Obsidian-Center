@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -22,6 +23,7 @@ type Config struct {
 	Addr      string
 	DBPath    string
 	JWTSecret string
+	WebDir    string
 }
 
 func main() {
@@ -29,6 +31,7 @@ func main() {
 	flag.StringVar(&cfg.Addr, "addr", ":8080", "server listen address")
 	flag.StringVar(&cfg.DBPath, "db", "obsidian-center.db", "SQLite database path")
 	flag.StringVar(&cfg.JWTSecret, "jwt-secret", "", "JWT signing secret (required)")
+	flag.StringVar(&cfg.WebDir, "web-dir", "", "directory containing web editor files (index.html, dist/)")
 	flag.Parse()
 
 	if cfg.JWTSecret == "" {
@@ -37,6 +40,9 @@ func main() {
 	if cfg.JWTSecret == "" {
 		fmt.Fprintln(os.Stderr, "error: jwt-secret is required (flag or OC_JWT_SECRET env)")
 		os.Exit(1)
+	}
+	if cfg.WebDir == "" {
+		cfg.WebDir = os.Getenv("OC_WEB_DIR")
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -66,7 +72,14 @@ func main() {
 	storeAdapter := sync.NewStoreAdapter(vaultStore)
 	syncEngine := sync.NewEngine(storeAdapter, graphStore)
 
-	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore, syncEngine, graphStore)
+	// Set up web editor static file serving
+	var webFS fs.FS
+	if cfg.WebDir != "" {
+		webFS = os.DirFS(cfg.WebDir)
+		slog.Info("serving web editor", "dir", cfg.WebDir)
+	}
+
+	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore, syncEngine, graphStore, webFS)
 
 	srv := &http.Server{
 		Addr:         cfg.Addr,

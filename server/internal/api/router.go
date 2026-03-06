@@ -1,6 +1,7 @@
 package api
 
 import (
+	"io/fs"
 	"net/http"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
@@ -9,7 +10,7 @@ import (
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 )
 
-func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.SessionStore, vaults *vault.Store, engine *sync.Engine, graphs *graph.Store) http.Handler {
+func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.SessionStore, vaults *vault.Store, engine *sync.Engine, graphs *graph.Store, webFS fs.FS) http.Handler {
 	mux := http.NewServeMux()
 
 	authHandler := &AuthHandler{jwt: jwt, users: users, sessions: sessions}
@@ -50,6 +51,31 @@ func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.Sessi
 
 	// Mount protected routes with auth middleware
 	mux.Handle("/api/", auth.Middleware(jwt)(protected))
+
+	// Static files for web editor
+	if webFS != nil {
+		staticHandler := http.FileServerFS(webFS)
+		mux.Handle("GET /static/", http.StripPrefix("/static/", staticHandler))
+
+		// Serve index.html for all non-API routes (SPA fallback)
+		mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				// Try static file first, fall back to index.html
+				if _, err := fs.Stat(webFS, r.URL.Path[1:]); err == nil {
+					staticHandler.ServeHTTP(w, r)
+					return
+				}
+			}
+			// Serve index.html
+			data, err := fs.ReadFile(webFS, "index.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(data)
+		})
+	}
 
 	return mux
 }
