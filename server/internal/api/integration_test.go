@@ -13,7 +13,7 @@ import (
 	"github.com/Cyber-Mat/obsidian-center/server/internal/api"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/graph"
-	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
+	syncpkg "github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 
 	"github.com/gorilla/websocket"
@@ -26,7 +26,7 @@ type testEnv struct {
 	userStore    *auth.UserStore
 	sessionStore *auth.SessionStore
 	vaultStore   *vault.Store
-	syncEngine   *sync.Engine
+	syncEngine   *syncpkg.Engine
 	graphStore   *graph.Store
 }
 
@@ -48,8 +48,8 @@ func newTestEnv(t *testing.T) *testEnv {
 	sessions := auth.NewSessionStore(db)
 	vaults := vault.NewStore(db)
 	graphs := graph.NewStore(db)
-	adapter := sync.NewStoreAdapter(vaults)
-	engine := sync.NewEngine(adapter, graphs)
+	adapter := syncpkg.NewStoreAdapter(vaults)
+	engine := syncpkg.NewEngine(adapter, graphs)
 	t.Cleanup(func() { engine.Shutdown() })
 
 	router := api.NewRouter(jwtSvc, users, sessions, vaults, engine, graphs, nil)
@@ -163,6 +163,15 @@ func jsonBody(t *testing.T, v interface{}) io.Reader {
 		t.Fatalf("marshal: %v", err)
 	}
 	return bytes.NewReader(b)
+}
+
+func mustJSON(t *testing.T, v interface{}) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return json.RawMessage(b)
 }
 
 func readJSON(t *testing.T, resp *http.Response) map[string]interface{} {
@@ -478,13 +487,22 @@ func TestWebSocketSync(t *testing.T) {
 	}
 
 	// Send auth message (first message must be auth token)
-	err = conn.WriteJSON(map[string]string{"type": "auth", "token": token})
+	err = conn.WriteJSON(syncpkg.WireMessage{Type: "auth", Data: mustJSON(t, syncpkg.AuthData{Token: token})})
 	if err != nil {
 		t.Fatalf("send auth: %v", err)
 	}
 
-	// Should receive sync messages (the initial sync)
+	// Should receive auth_ok first
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var authOk syncpkg.WireMessage
+	if err := conn.ReadJSON(&authOk); err != nil {
+		t.Fatalf("read auth_ok: %v", err)
+	}
+	if authOk.Type != "auth_ok" {
+		t.Fatalf("expected auth_ok, got %s", authOk.Type)
+	}
+
+	// Should receive sync messages (the initial sync)
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
 		t.Fatalf("read initial sync: %v", err)
@@ -521,17 +539,34 @@ func TestWebSocketSyncTwoClients(t *testing.T) {
 	defer conn2.Close()
 
 	// Both send auth
-	conn1.WriteJSON(map[string]string{"type": "auth", "token": token})
-	conn2.WriteJSON(map[string]string{"type": "auth", "token": token})
+	conn1.WriteJSON(syncpkg.WireMessage{Type: "auth", Data: mustJSON(t, syncpkg.AuthData{Token: token})})
+	conn2.WriteJSON(syncpkg.WireMessage{Type: "auth", Data: mustJSON(t, syncpkg.AuthData{Token: token})})
+
+	// Both should receive auth_ok first
+	conn1.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var authOk1 syncpkg.WireMessage
+	if err := conn1.ReadJSON(&authOk1); err != nil {
+		t.Fatalf("ws1 read auth_ok: %v", err)
+	}
+	if authOk1.Type != "auth_ok" {
+		t.Fatalf("ws1 expected auth_ok, got %s", authOk1.Type)
+	}
+
+	conn2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var authOk2 syncpkg.WireMessage
+	if err := conn2.ReadJSON(&authOk2); err != nil {
+		t.Fatalf("ws2 read auth_ok: %v", err)
+	}
+	if authOk2.Type != "auth_ok" {
+		t.Fatalf("ws2 expected auth_ok, got %s", authOk2.Type)
+	}
 
 	// Both should receive initial sync data
-	conn1.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, _, err = conn1.ReadMessage()
 	if err != nil {
 		t.Fatalf("ws1 read: %v", err)
 	}
 
-	conn2.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, _, err = conn2.ReadMessage()
 	if err != nil {
 		t.Fatalf("ws2 read: %v", err)

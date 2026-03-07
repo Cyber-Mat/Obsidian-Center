@@ -10,6 +10,7 @@ const (
 	MsgTypePong    = "pong"
 	MsgTypeError   = "error"
 	MsgTypeAuth    = "auth"
+	MsgTypeAuthOk  = "auth_ok"
 )
 
 // WireMessage is the envelope for all WebSocket messages.

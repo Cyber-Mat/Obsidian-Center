@@ -141,6 +141,9 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Confirm authentication to the client
+	conn.WriteJSON(sync.WireMessage{Type: sync.MsgTypeAuthOk})
+
 	// Ensure CRDT doc is loaded
 	if _, err := h.engine.GetDoc(vaultID); err != nil {
 		slog.Error("failed to load CRDT doc", "vault", vaultID, "error", err)
