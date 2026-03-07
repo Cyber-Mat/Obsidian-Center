@@ -37,13 +37,18 @@ export class SettingsTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Server URL")
-			.setDesc("The URL of your Obsidian Center server")
+			.setDesc("The URL of your Obsidian Center server (must use HTTPS)")
 			.addText((text) =>
 				text
 					.setPlaceholder("https://your-server.example.com")
 					.setValue(this.plugin.settings.serverUrl)
 					.onChange(async (value) => {
-						this.plugin.settings.serverUrl = value.trim();
+						const url = value.trim();
+						if (url && !url.startsWith("https://") && !url.startsWith("http://localhost") && !url.startsWith("http://127.0.0.1")) {
+							new Notice("Server URL must use HTTPS (http://localhost allowed for development)");
+							return;
+						}
+						this.plugin.settings.serverUrl = url;
 						await this.plugin.saveSettings();
 					})
 			);
@@ -137,7 +142,7 @@ export class SettingsTab extends PluginSettingTab {
 					.setValue(String(this.plugin.settings.debounceMs))
 					.onChange(async (value) => {
 						const n = parseInt(value, 10);
-						if (!isNaN(n) && n >= 0) {
+						if (!isNaN(n) && n >= 100) {
 							this.plugin.settings.debounceMs = n;
 							await this.plugin.saveSettings();
 						}
@@ -175,6 +180,10 @@ export class SettingsTab extends PluginSettingTab {
 			}
 
 			const data = await resp.json();
+			if (typeof data.access_token !== "string" || typeof data.refresh_token !== "string") {
+				new Notice("Login failed: invalid server response");
+				return;
+			}
 			this.plugin.settings.accessToken = data.access_token;
 			this.plugin.settings.refreshToken = data.refresh_token;
 			await this.plugin.saveSettings();
@@ -203,6 +212,10 @@ export class SettingsTab extends PluginSettingTab {
 			}
 
 			const data = await resp.json();
+			if (typeof data.access_token !== "string" || typeof data.refresh_token !== "string") {
+				new Notice("Registration failed: invalid server response");
+				return;
+			}
 			this.plugin.settings.accessToken = data.access_token;
 			this.plugin.settings.refreshToken = data.refresh_token;
 			await this.plugin.saveSettings();
@@ -235,6 +248,10 @@ export class SettingsTab extends PluginSettingTab {
 			}
 
 			const vault = await resp.json();
+			if (typeof vault.id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(vault.id)) {
+				new Notice("Create vault failed: invalid vault ID from server");
+				return;
+			}
 			this.plugin.settings.vaultId = vault.id;
 			await this.plugin.saveSettings();
 			new Notice(`Vault "${name}" created`);

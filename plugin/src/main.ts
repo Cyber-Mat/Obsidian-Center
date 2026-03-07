@@ -204,6 +204,28 @@ export default class ObsidianCenterPlugin extends Plugin {
 		}
 	}
 
+	/**
+	 * Validate that a file path from a remote patch is safe to apply.
+	 * Rejects path traversal, absolute paths, null bytes, and .obsidian/ writes.
+	 */
+	private isSafeVaultPath(filePath: string): boolean {
+		if (!filePath || typeof filePath !== "string") return false;
+		// Reject null bytes
+		if (filePath.includes("\0")) return false;
+		// Reject absolute paths and Windows drive letters
+		if (filePath.startsWith("/") || /^[a-zA-Z]:/.test(filePath)) return false;
+		// Reject backslashes (Windows path separator)
+		if (filePath.includes("\\")) return false;
+		// Reject path traversal segments
+		const segments = filePath.split("/");
+		for (const seg of segments) {
+			if (seg === ".." || seg === ".") return false;
+		}
+		// Reject writes into .obsidian/ (plugin config, themes, etc.)
+		if (filePath.startsWith(".obsidian/") || filePath === ".obsidian") return false;
+		return true;
+	}
+
 	// --- Remote patches → local vault ---
 
 	private async onRemotePatches(patches: Patch[]) {
@@ -214,6 +236,10 @@ export default class ObsidianCenterPlugin extends Plugin {
 		for (const patch of patches) {
 			if (patch.path.length >= 2 && patch.path[0] === "files") {
 				const filePath = patch.path[1] as string;
+				if (!this.isSafeVaultPath(filePath)) {
+					console.warn("OC: rejected unsafe remote path:", filePath);
+					continue;
+				}
 				if (patch.action === "del" && patch.path.length === 2) {
 					deletedPaths.add(filePath);
 				} else {

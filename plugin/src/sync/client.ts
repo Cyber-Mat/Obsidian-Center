@@ -37,6 +37,7 @@ export class SyncClient {
 	private syncInFlight = false;
 	private reconnectAttempts = 0;
 	private authenticated = false;
+	private pendingSyncOnAuth = false;
 
 	constructor(
 		serverUrl: string,
@@ -90,11 +91,18 @@ export class SyncClient {
 	}
 
 	private doConnect(): void {
+		// Validate vaultId to prevent URL injection
+		if (!this.vaultId || !/^[a-zA-Z0-9_-]+$/.test(this.vaultId)) {
+			this.callbacks.onError(new Error("Invalid vault ID format"));
+			return;
+		}
+
 		const wsUrl = this.serverUrl.replace(/^http/, "ws").replace(/\/$/, "");
 
 		// Reset sync state on new connection so we do a full sync
 		this.crdt.resetSyncState();
 		this.authenticated = false;
+		this.pendingSyncOnAuth = false;
 
 		// Connect without token in URL — send auth as first message
 		this.ws = new WebSocket(`${wsUrl}/api/sync/${this.vaultId}`);
@@ -103,17 +111,14 @@ export class SyncClient {
 			this.reconnectDelay = 1000;
 			this.reconnectAttempts = 0;
 
-			// Send auth as first message instead of URL query param
+			// Send auth as first message — do NOT send sync data until
+			// the server confirms authentication with an "auth_ok" message.
 			const authMsg: WireMessage = {
 				type: "auth",
 				data: { token: this.token },
 			};
 			this.ws!.send(JSON.stringify(authMsg));
-			this.authenticated = true;
-			this.callbacks.onConnected();
-
-			// Start sync protocol: send our initial sync message
-			this.sendPendingSyncMessages();
+			this.pendingSyncOnAuth = true;
 		};
 
 		this.ws.onmessage = (event: MessageEvent) => {
@@ -161,7 +166,17 @@ export class SyncClient {
 		if (!msg || typeof msg.type !== "string") return;
 
 		switch (msg.type) {
+			case "auth_ok": {
+				this.authenticated = true;
+				this.callbacks.onConnected();
+				if (this.pendingSyncOnAuth) {
+					this.pendingSyncOnAuth = false;
+					this.sendPendingSyncMessages();
+				}
+				break;
+			}
 			case "sync": {
+				if (!this.authenticated) return;
 				const data = msg.data as SyncData;
 				if (!data?.message) return;
 				const messageBytes = base64ToUint8Array(data.message);
@@ -188,6 +203,7 @@ export class SyncClient {
 
 	private sendPendingSyncMessages(): void {
 		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+		if (!this.authenticated) return;
 		if (this.syncInFlight) return;
 
 		this.syncInFlight = true;
