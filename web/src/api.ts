@@ -61,20 +61,29 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   return resp;
 }
 
+let refreshPromise: Promise<boolean> | null = null;
+
 async function doRefresh(): Promise<boolean> {
-  try {
-    const resp = await fetch(`${baseUrl}/api/auth/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    });
-    if (!resp.ok) return false;
-    const data = await resp.json();
-    setTokens(data.access_token, data.refresh_token);
-    return true;
-  } catch {
-    return false;
-  }
+  // Prevent concurrent refresh requests — reuse in-flight promise
+  if (refreshPromise) return refreshPromise;
+  refreshPromise = (async () => {
+    try {
+      const resp = await fetch(`${baseUrl}/api/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
+      if (!resp.ok) return false;
+      const data = await resp.json();
+      setTokens(data.access_token, data.refresh_token);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      refreshPromise = null;
+    }
+  })();
+  return refreshPromise;
 }
 
 // Auth
@@ -142,7 +151,8 @@ export async function listFiles(vaultId: string): Promise<FileMeta[]> {
 }
 
 export async function getFile(vaultId: string, path: string): Promise<string> {
-  const resp = await apiFetch(`/api/vaults/${vaultId}/files/${path}`);
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  const resp = await apiFetch(`/api/vaults/${vaultId}/files/${encodedPath}`);
   if (!resp.ok) throw new Error("failed to get file");
   const data = await resp.json();
   return data.content || "";

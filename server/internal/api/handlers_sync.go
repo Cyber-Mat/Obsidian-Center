@@ -6,12 +6,20 @@ import (
 	"net/http"
 	"net/url"
 	gosync "sync"
+	"time"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 	"github.com/automerge/automerge-go"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	maxMessageSize = 16 << 20 // 16 MB
+	pingInterval   = 30 * time.Second
+	pongWait       = 60 * time.Second
+	writeWait      = 10 * time.Second
 )
 
 var upgrader = websocket.Upgrader{
@@ -63,6 +71,7 @@ type SyncClient struct {
 	send      chan []byte
 	hub       *SyncHub
 	syncState *automerge.SyncState
+	mu        gosync.Mutex // protects syncState
 }
 
 func (h *SyncHandler) getOrCreateHub(vaultID string) *SyncHub {
@@ -88,6 +97,8 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		slog.Error("websocket upgrade failed", "error", err)
 		return
 	}
+
+	conn.SetReadLimit(maxMessageSize)
 
 	// Auth: check query param first, then expect first message
 	var userID int64
@@ -156,27 +167,31 @@ func (h *SyncHandler) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		syncState: syncState,
 	}
 
+	// Generate initial sync messages BEFORE adding to hub
+	if !h.sendPendingSyncMessages(client) {
+		conn.Close()
+		return
+	}
+
 	hub.mu.Lock()
 	hub.clients[client] = true
 	hub.mu.Unlock()
 
 	slog.Info("sync client connected", "vault", vaultID, "user", userID)
 
-	// Generate initial sync messages to bring client up to date
-	if !h.sendPendingSyncMessages(client) {
-		conn.Close()
-		return
-	}
-
 	go client.writePump()
 	go client.readPump(h)
 }
 
 // sendPendingSyncMessages generates and queues all pending sync messages for a client.
-// Returns false if the client's send buffer overflowed and it should be disconnected.
+// Returns false if the client's send buffer overflowed.
 func (h *SyncHandler) sendPendingSyncMessages(client *SyncClient) bool {
+	client.mu.Lock()
+	defer client.mu.Unlock()
+
+	vaultID := client.hub.vaultID
 	for {
-		msgBytes, valid := h.engine.GenerateSyncMessage(client.syncState)
+		msgBytes, valid := h.engine.GenerateSyncMessage(vaultID, client.syncState)
 		if !valid {
 			break
 		}
@@ -185,8 +200,7 @@ func (h *SyncHandler) sendPendingSyncMessages(client *SyncClient) bool {
 		select {
 		case client.send <- wireMsg:
 		default:
-			slog.Warn("client send buffer full, disconnecting", "vault", client.hub.vaultID)
-			close(client.send)
+			slog.Warn("client send buffer full, disconnecting", "vault", vaultID)
 			return false
 		}
 	}
@@ -198,9 +212,16 @@ func (c *SyncClient) readPump(h *SyncHandler) {
 		c.hub.mu.Lock()
 		delete(c.hub.clients, c)
 		c.hub.mu.Unlock()
+		close(c.send) // signal writePump to exit
 		c.conn.Close()
 		slog.Info("sync client disconnected", "vault", c.hub.vaultID, "user", c.userID)
 	}()
+
+	c.conn.SetPongHandler(func(string) error {
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 
 	for {
 		var msg sync.WireMessage
@@ -225,11 +246,29 @@ func (c *SyncClient) readPump(h *SyncHandler) {
 }
 
 func (c *SyncClient) writePump() {
-	defer c.conn.Close()
+	ticker := time.NewTicker(pingInterval)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
 
-	for data := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			return
+	for {
+		select {
+		case data, ok := <-c.send:
+			if !ok {
+				// Channel closed — readPump exited
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }

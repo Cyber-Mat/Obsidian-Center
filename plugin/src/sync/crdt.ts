@@ -79,7 +79,7 @@ export class CRDTManager {
 
 		// Use updateText for text diffs (better CRDT merging)
 		if (!isBinary) {
-			Automerge.updateText(this.doc, ["files", path, "content"], textContent);
+			this.doc = Automerge.updateText(this.doc, ["files", path, "content"], textContent);
 		} else {
 			this.doc = Automerge.change(this.doc, (d) => {
 				d.files[path].content = textContent;

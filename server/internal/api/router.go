@@ -14,7 +14,7 @@ func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.Sessi
 	mux := http.NewServeMux()
 
 	authHandler := &AuthHandler{jwt: jwt, users: users, sessions: sessions}
-	vaultHandler := &VaultHandler{vaults: vaults}
+	vaultHandler := &VaultHandler{vaults: vaults, engine: engine}
 	syncHandler := NewSyncHandler(vaults, jwt, engine)
 	graphHandler := &GraphHandler{vaults: vaults, graphs: graphs}
 
@@ -27,6 +27,7 @@ func NewRouter(jwt *auth.JWTService, users *auth.UserStore, sessions *auth.Sessi
 	mux.HandleFunc("POST /api/auth/register", authHandler.Register)
 	mux.HandleFunc("POST /api/auth/login", authHandler.Login)
 	mux.HandleFunc("POST /api/auth/refresh", authHandler.Refresh)
+	mux.HandleFunc("POST /api/auth/logout", authHandler.Logout)
 
 	// Protected routes
 	protected := http.NewServeMux()

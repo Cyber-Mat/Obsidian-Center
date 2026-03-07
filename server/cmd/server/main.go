@@ -82,11 +82,12 @@ func main() {
 	router := api.NewRouter(jwtService, userStore, sessionStore, vaultStore, syncEngine, graphStore, webFS)
 
 	srv := &http.Server{
-		Addr:         cfg.Addr,
-		Handler:      router,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:        cfg.Addr,
+		Handler:     router,
+		ReadTimeout: 15 * time.Second,
+		// WriteTimeout must be 0 for WebSocket connections to stay alive.
+		// Per-request timeouts are handled at the handler level.
+		IdleTimeout: 60 * time.Second,
 	}
 
 	done := make(chan os.Signal, 1)

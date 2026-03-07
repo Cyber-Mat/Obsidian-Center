@@ -40,6 +40,11 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.Username) < 3 || len(req.Username) > 64 {
+		writeError(w, http.StatusBadRequest, "username must be 3-64 characters")
+		return
+	}
+
 	if len(req.Password) < 8 {
 		writeError(w, http.StatusBadRequest, "password must be at least 8 characters")
 		return
@@ -126,9 +131,6 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rotate: delete old session, create new one
-	h.sessions.Delete(session.ID)
-
 	accessToken, err := h.jwt.GenerateAccessToken(user.ID, user.Username)
 	if err != nil {
 		slog.Error("generate access token failed", "error", err)
@@ -136,6 +138,7 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Rotate: create new session first, then delete old one (atomic ordering)
 	_, newRefresh, err := h.sessions.Create(user.ID)
 	if err != nil {
 		slog.Error("create session failed", "error", err)
@@ -143,8 +146,27 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.sessions.Delete(session.ID)
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"access_token":  accessToken,
 		"refresh_token": newRefresh,
 	})
+}
+
+func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
+	var req refreshRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.RefreshToken != "" {
+		session, err := h.sessions.ValidateRefresh(req.RefreshToken)
+		if err == nil {
+			h.sessions.Delete(session.ID)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

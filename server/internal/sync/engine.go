@@ -1,6 +1,7 @@
 package sync
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -29,60 +30,75 @@ type FileRecord struct {
 
 // Engine manages CRDT documents for all vaults.
 type Engine struct {
-	store  CRDTStore
-	graphs *graph.Store
-	mu     gosync.Mutex
-	vaults map[string]*vaultState
+	store    CRDTStore
+	graphs   *graph.Store
+	mu       gosync.Mutex
+	vaults   map[string]*vaultState
+	cancel   context.CancelFunc
+	stopped  chan struct{}
 }
 
 type vaultState struct {
-	doc    *VaultDoc
-	mu     gosync.Mutex
-	dirty  bool
+	doc      *VaultDoc
+	mu       gosync.Mutex
+	dirty    bool
 	lastSave time.Time
 }
 
 // NewEngine creates a sync engine.
 func NewEngine(store CRDTStore, graphs *graph.Store) *Engine {
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
-		store:  store,
-		graphs: graphs,
-		vaults: make(map[string]*vaultState),
+		store:   store,
+		graphs:  graphs,
+		vaults:  make(map[string]*vaultState),
+		cancel:  cancel,
+		stopped: make(chan struct{}),
 	}
-	go e.persistLoop()
+	go e.persistLoop(ctx)
 	return e
 }
 
 // persistLoop periodically saves dirty documents to the database.
-func (e *Engine) persistLoop() {
+func (e *Engine) persistLoop(ctx context.Context) {
+	defer close(e.stopped)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		e.mu.Lock()
-		vaultIDs := make([]string, 0, len(e.vaults))
-		for id := range e.vaults {
-			vaultIDs = append(vaultIDs, id)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			e.persistAllDirty()
 		}
-		e.mu.Unlock()
+	}
+}
 
-		for _, id := range vaultIDs {
-			vs := e.getVaultState(id)
-			if vs == nil {
-				continue
-			}
-			vs.mu.Lock()
-			if vs.dirty {
-				data := vs.doc.Save()
-				if err := e.store.SaveCRDTState(id, data); err != nil {
-					slog.Error("failed to persist CRDT state", "vault", id, "error", err)
-				} else {
-					vs.dirty = false
-					vs.lastSave = time.Now()
-				}
-			}
-			vs.mu.Unlock()
+func (e *Engine) persistAllDirty() {
+	e.mu.Lock()
+	vaultIDs := make([]string, 0, len(e.vaults))
+	for id := range e.vaults {
+		vaultIDs = append(vaultIDs, id)
+	}
+	e.mu.Unlock()
+
+	for _, id := range vaultIDs {
+		vs := e.getVaultState(id)
+		if vs == nil {
+			continue
 		}
+		vs.mu.Lock()
+		if vs.dirty {
+			data := vs.doc.Save()
+			if err := e.store.SaveCRDTState(id, data); err != nil {
+				slog.Error("failed to persist CRDT state", "vault", id, "error", err)
+			} else {
+				vs.dirty = false
+				vs.lastSave = time.Now()
+			}
+		}
+		vs.mu.Unlock()
 	}
 }
 
@@ -93,14 +109,17 @@ func (e *Engine) getVaultState(vaultID string) *vaultState {
 }
 
 // GetDoc loads or creates the CRDT document for a vault.
+// Safe for concurrent calls — uses double-checked locking.
 func (e *Engine) GetDoc(vaultID string) (*VaultDoc, error) {
 	e.mu.Lock()
 	vs, ok := e.vaults[vaultID]
-	e.mu.Unlock()
-
 	if ok {
+		e.mu.Unlock()
 		return vs.doc, nil
 	}
+	// Hold the engine lock while loading to prevent TOCTOU race
+	// where two goroutines both see !ok and create duplicate vaultStates.
+	defer e.mu.Unlock()
 
 	// Load from database
 	data, err := e.store.GetCRDTState(vaultID)
@@ -124,9 +143,7 @@ func (e *Engine) GetDoc(vaultID string) (*VaultDoc, error) {
 	}
 
 	vs = &vaultState{doc: doc, dirty: true, lastSave: time.Now()}
-	e.mu.Lock()
 	e.vaults[vaultID] = vs
-	e.mu.Unlock()
 
 	// Persist immediately after bootstrap
 	if err := e.store.SaveCRDTState(vaultID, doc.Save()); err != nil {
@@ -155,34 +172,15 @@ func (e *Engine) bootstrapFromFiles(vaultID string, doc *VaultDoc) error {
 	return nil
 }
 
-// LockVault acquires the per-vault lock. Must call UnlockVault when done.
-func (e *Engine) LockVault(vaultID string) {
-	e.mu.Lock()
-	vs, ok := e.vaults[vaultID]
-	e.mu.Unlock()
-	if ok {
-		vs.mu.Lock()
-	}
-}
-
-// UnlockVault releases the per-vault lock.
-func (e *Engine) UnlockVault(vaultID string) {
-	e.mu.Lock()
-	vs, ok := e.vaults[vaultID]
-	e.mu.Unlock()
-	if ok {
-		vs.mu.Unlock()
-	}
-}
-
 // MarkDirty marks the vault's CRDT state as needing persistence.
 func (e *Engine) MarkDirty(vaultID string) {
-	e.mu.Lock()
-	vs, ok := e.vaults[vaultID]
-	e.mu.Unlock()
-	if ok {
-		vs.dirty = true
+	vs := e.getVaultState(vaultID)
+	if vs == nil {
+		return
 	}
+	vs.mu.Lock()
+	vs.dirty = true
+	vs.mu.Unlock()
 }
 
 // NewSyncState creates a new sync state for a peer connected to a vault.
@@ -196,10 +194,8 @@ func (e *Engine) NewSyncState(vaultID string) (*automerge.SyncState, error) {
 
 // ReceiveSyncMessage processes an incoming sync message from a client.
 func (e *Engine) ReceiveSyncMessage(vaultID string, syncState *automerge.SyncState, msg []byte) error {
-	e.mu.Lock()
-	vs, ok := e.vaults[vaultID]
-	e.mu.Unlock()
-	if !ok {
+	vs := e.getVaultState(vaultID)
+	if vs == nil {
 		return fmt.Errorf("vault not loaded: %s", vaultID)
 	}
 
@@ -215,12 +211,54 @@ func (e *Engine) ReceiveSyncMessage(vaultID string, syncState *automerge.SyncSta
 }
 
 // GenerateSyncMessage generates the next message to send to a peer.
-func (e *Engine) GenerateSyncMessage(syncState *automerge.SyncState) ([]byte, bool) {
+// Must be called while the vault lock is held or from a single goroutine per syncState.
+func (e *Engine) GenerateSyncMessage(vaultID string, syncState *automerge.SyncState) ([]byte, bool) {
+	vs := e.getVaultState(vaultID)
+	if vs == nil {
+		return nil, false
+	}
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
 	msg, valid := syncState.GenerateMessage()
 	if !valid {
 		return nil, false
 	}
 	return msg.Bytes(), true
+}
+
+// PutFileFromREST updates a file in the CRDT document (for REST API writes).
+func (e *Engine) PutFileFromREST(vaultID, path string, content []byte, isBinary bool) error {
+	vs := e.getVaultState(vaultID)
+	if vs == nil {
+		return fmt.Errorf("vault not loaded: %s", vaultID)
+	}
+
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	if err := vs.doc.PutFile(path, content, isBinary); err != nil {
+		return err
+	}
+	vs.dirty = true
+	return nil
+}
+
+// DeleteFileFromREST removes a file from the CRDT document (for REST API deletes).
+func (e *Engine) DeleteFileFromREST(vaultID, path string) error {
+	vs := e.getVaultState(vaultID)
+	if vs == nil {
+		return fmt.Errorf("vault not loaded: %s", vaultID)
+	}
+
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	if err := vs.doc.DeleteFile(path); err != nil {
+		return err
+	}
+	vs.dirty = true
+	return nil
 }
 
 // fileSnapshot holds a consistent snapshot of a file's state from the CRDT doc.
@@ -234,10 +272,8 @@ type fileSnapshot struct {
 // MaterializeFiles syncs the CRDT document state to the vault_files table
 // and re-indexes wiki-links for markdown files.
 func (e *Engine) MaterializeFiles(vaultID string) error {
-	e.mu.Lock()
-	vs, ok := e.vaults[vaultID]
-	e.mu.Unlock()
-	if !ok {
+	vs := e.getVaultState(vaultID)
+	if vs == nil {
 		return fmt.Errorf("vault not loaded: %s", vaultID)
 	}
 
@@ -290,8 +326,11 @@ func isMarkdown(path string) bool {
 	return strings.HasSuffix(strings.ToLower(path), ".md")
 }
 
-// Shutdown persists all dirty documents.
+// Shutdown persists all dirty documents and stops the persist loop.
 func (e *Engine) Shutdown() {
+	e.cancel()
+	<-e.stopped
+
 	e.mu.Lock()
 	defer e.mu.Unlock()
 

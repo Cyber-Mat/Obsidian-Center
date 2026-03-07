@@ -102,7 +102,10 @@ function buildTree(paths: string[]): TreeNode {
     for (let i = 0; i < parts.length; i++) {
       const part = parts[i];
       const isLast = i === parts.length - 1;
-      const existingChild = current.children.find((c) => c.name === part);
+      const isFolder = !isLast;
+      const existingChild = current.children.find(
+        (c) => c.name === part && c.isFolder === isFolder
+      );
 
       if (existingChild) {
         current = existingChild;

@@ -96,13 +96,14 @@ export class Editor {
     const currentContent = this.view.state.doc.toString();
     if (currentContent === newContent) return;
 
+    // Compute minimal diff to preserve cursor position and undo history
+    const changes = computeMinimalChanges(currentContent, newContent);
+    if (changes.length === 0) return;
+
     this.suppressUpdates = true;
     this.view.dispatch({
-      changes: {
-        from: 0,
-        to: this.view.state.doc.length,
-        insert: newContent,
-      },
+      changes,
+      annotations: [Transaction.addToHistory.of(false)],
     });
     this.suppressUpdates = false;
   }
@@ -153,4 +154,41 @@ export class Editor {
       this.view = null;
     }
   }
+}
+
+/**
+ * Compute a minimal set of changes between two strings by trimming common
+ * prefix and suffix. This preserves cursor position and undo history
+ * when applying remote CRDT changes.
+ */
+function computeMinimalChanges(
+  oldText: string,
+  newText: string
+): { from: number; to: number; insert: string }[] {
+  let prefixLen = 0;
+  const minLen = Math.min(oldText.length, newText.length);
+  while (prefixLen < minLen && oldText[prefixLen] === newText[prefixLen]) {
+    prefixLen++;
+  }
+
+  let oldSuffix = oldText.length;
+  let newSuffix = newText.length;
+  while (
+    oldSuffix > prefixLen &&
+    newSuffix > prefixLen &&
+    oldText[oldSuffix - 1] === newText[newSuffix - 1]
+  ) {
+    oldSuffix--;
+    newSuffix--;
+  }
+
+  if (prefixLen === oldSuffix && prefixLen === newSuffix) return [];
+
+  return [
+    {
+      from: prefixLen,
+      to: oldSuffix,
+      insert: newText.slice(prefixLen, newSuffix),
+    },
+  ];
 }

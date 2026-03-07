@@ -1,714 +1,257 @@
 # Obsidian Center — Architecture
 
-## Vision
-
-Obsidian Center is a self-hosted platform that extends Obsidian into a
-collaborative knowledge engine. It provides vault synchronization across
-devices, a web-based editor for browser access, and a foundation for
-RAG-powered retrieval and autonomous agents that use Obsidian vaults as
-structured knowledge stores.
-
-Obsidian remains the primary user interface and formatting standard.
-Obsidian Center operates as the infrastructure layer beneath it.
-
----
+A self-hosted platform for synchronizing Obsidian vaults across devices, with a
+web-based editor and real-time CRDT-powered sync.
 
 ## System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      Clients                                │
-│                                                             │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │   Obsidian    │  │  Web Editor  │  │  API Consumers    │  │
-│  │   Plugin      │  │  (Browser)   │  │  (Agents, CLI)    │  │
-│  │              │  │              │  │                   │  │
-│  │  TypeScript   │  │  CodeMirror  │  │  REST / WebSocket │  │
-│  │  + Automerge  │  │  + Automerge │  │                   │  │
-│  │    (WASM)     │  │    (WASM)    │  │                   │  │
-│  └──────┬───────┘  └──────┬───────┘  └────────┬──────────┘  │
-│         │                 │                    │             │
-└─────────┼─────────────────┼────────────────────┼─────────────┘
-          │                 │                    │
-          │    WebSocket    │    WebSocket       │   REST
-          │    + REST       │    + REST          │
-          │                 │                    │
-┌─────────▼─────────────────▼────────────────────▼─────────────┐
-│                                                              │
-│                    Obsidian Center Server                     │
-│                         (Go binary)                          │
-│                                                              │
-│  ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌───────────┐  │
-│  │    Sync    │ │    Auth    │ │   Vault    │ │    API    │  │
-│  │   Engine   │ │  (JWT)     │ │  Storage   │ │  Router   │  │
-│  │            │ │            │ │            │ │           │  │
-│  │ Automerge  │ │ Access     │ │ Files +    │ │           │  │
-│  │ (Go/CGO)   │ │ Refresh    │ │ Metadata   │ │           │  │
-│  │            │ │ Tokens     │ │            │ │           │  │
-│  └─────┬──────┘ └────────────┘ └─────┬──────┘ └───────────┘  │
-│        │                             │                       │
-│  ┌─────▼─────────────────────────────▼──────────────────┐    │
-│  │                    SQLite                             │    │
-│  │                                                      │    │
-│  │  ┌──────────┐  ┌───────────┐  ┌───────────────────┐  │    │
-│  │  │  CRDT    │  │  Vault    │  │  sqlite-vec       │  │    │
-│  │  │  State   │  │  Files +  │  │  (embeddings)     │  │    │
-│  │  │          │  │  Metadata │  │                   │  │    │
-│  │  └──────────┘  └───────────┘  └───────────────────┘  │    │
-│  │                                                      │    │
-│  │  ┌──────────────────────────────────────────────┐    │    │
-│  │  │  Link Graph (vault_links)                    │    │    │
-│  │  │  source_path → target_path with backlinks    │    │    │
-│  │  └──────────────────────────────────────────────┘    │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                              │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │              Future: RAG + Agents                     │    │
-│  │                                                      │    │
-│  │  Embedding pipeline → sqlite-vec index               │    │
-│  │  Agent runtime (goroutines) → Claude API             │    │
-│  │  Knowledge graph extraction from vault links          │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                  Docker Container (:8080)                │
+│                                                         │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │                  Go HTTP Server                    │  │
+│  │                                                    │  │
+│  │  ┌──────────┐  ┌────────────┐  ┌──────────────┐   │  │
+│  │  │ REST API │  │ WebSocket  │  │ Static Files │   │  │
+│  │  │ Handlers │  │  /api/sync │  │ (Web Editor) │   │  │
+│  │  └────┬─────┘  └─────┬──────┘  └──────────────┘   │  │
+│  │       │               │                            │  │
+│  │  ┌────┴───────────────┴──────┐                     │  │
+│  │  │      Auth Middleware      │                     │  │
+│  │  │   (JWT + Refresh Tokens)  │                     │  │
+│  │  └────┬───────────────┬──────┘                     │  │
+│  │       │               │                            │  │
+│  │  ┌────┴─────┐   ┌─────┴──────────┐                │  │
+│  │  │  Vault   │   │  Sync Engine   │                │  │
+│  │  │  Store   │   │  (Automerge)   │                │  │
+│  │  │  (SQL)   │◄──┤  CRDT Docs     │                │  │
+│  │  └────┬─────┘   └────────────────┘                │  │
+│  │       │                                            │  │
+│  │  ┌────┴─────┐                                      │  │
+│  │  │  SQLite  │                                      │  │
+│  │  │  (WAL)   │                                      │  │
+│  │  └──────────┘                                      │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                         │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │             Web Editor (Static SPA)                │  │
+│  │                                                    │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌─────────────┐  │  │
+│  │  │ CodeMirror │  │ Automerge  │  │  WebSocket  │  │  │
+│  │  │  6 Editor  │  │ CRDT (WASM)│  │ Sync Client │  │  │
+│  │  └────────────┘  └────────────┘  └─────────────┘  │  │
+│  └────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+
+                         ▲
+          ┌──────────────┼──────────────┐
+          │              │              │
+  ┌───────┴───────┐ ┌───┴────┐ ┌───────┴───────┐
+  │  Obsidian PC  │ │ Web    │ │  Obsidian PC  │
+  │  + Plugin     │ │ Browser│ │  + Plugin     │
+  │  (Automerge   │ │        │ │  (Automerge   │
+  │   WASM)       │ │        │ │   WASM)       │
+  └───────────────┘ └────────┘ └───────────────┘
+```
+
+## Data Flow: PC-to-PC Sync
+
+```
+PC A (Obsidian Plugin)         Server              PC B (Obsidian Plugin)
+         │                       │                          │
+         │  1. Edit file locally │                          │
+         │  Automerge change     │                          │
+         │                       │                          │
+         │  2. WebSocket: send   │                          │
+         │  Automerge sync msg   │                          │
+         │──────────────────────>│                          │
+         │                       │  3. Receive sync msg     │
+         │                       │  Apply to server doc     │
+         │                       │                          │
+         │                       │  4. Generate sync msg    │
+         │                       │  for PC B               │
+         │                       │─────────────────────────>│
+         │                       │                          │
+         │                       │  5. PC B applies msg     │
+         │                       │  to local Automerge doc  │
+         │                       │                          │
+         │                       │  6. Materialize: persist │
+         │                       │  CRDT → SQLite files     │
 ```
 
 ---
 
-## Components
+## Component Details
 
-### 1. Obsidian Plugin (`plugin/`)
+### Go Server (`server/`)
 
-**Language:** TypeScript
-**Build:** esbuild (CommonJS output, es2018 target)
-**Runtime:** Obsidian desktop/mobile app
+| Package | Purpose |
+|---------|---------|
+| `cmd/server` | Entry point, config flags, graceful shutdown |
+| `internal/api` | HTTP handlers, router, WebSocket sync handler |
+| `internal/auth` | JWT tokens, bcrypt passwords, sessions, middleware |
+| `internal/vault` | SQLite store for vaults, files, CRDT state, migrations |
+| `internal/sync` | Automerge CRDT engine, document management, persist loop |
+| `internal/graph` | Link graph indexing (wikilinks, backlinks, traversal) |
 
-The plugin is the bridge between Obsidian's local vault and the
-Obsidian Center server. It runs inside Obsidian's Electron/Capacitor
-environment.
+**Key design decisions:**
 
-**Responsibilities:**
+- **Single binary** serves both REST API and static web editor files
+- **WriteTimeout = 0** on the HTTP server so WebSocket connections survive
+- **Automerge-go with CGO** for server-side CRDT operations
+- **Persist loop** periodically materializes CRDT state to SQLite
+- **REST-to-CRDT bridge**: PUT/DELETE file REST endpoints update the CRDT document,
+  ensuring changes propagate to all WebSocket peers
 
-- Monitor local vault changes via Obsidian's `Vault` event API
-  (`create`, `modify`, `delete`, `rename`)
-- Maintain a local Automerge document (WASM build) representing vault
-  state
-- Synchronize CRDT changes with the server over WebSocket
-- Apply remote changes to the local vault
-- Provide a settings UI for server URL, authentication, sync
-  preferences, and conflict visibility
-- Handle offline operation: queue changes locally, reconcile on
-  reconnect
+### Sync Engine (`internal/sync/engine.go`)
 
-**Key Obsidian APIs used:**
+The sync engine manages one Automerge CRDT document per vault:
 
-```typescript
-// File operations
-app.vault.read(file: TFile): Promise<string>
-app.vault.cachedRead(file: TFile): Promise<string>
-app.vault.modify(file: TFile, data: string): Promise<void>
-app.vault.process(file: TFile, fn: (data: string) => string): Promise<string>
-app.vault.create(path: string, data: string): Promise<TFile>
-app.vault.delete(file: TFile): Promise<void>
-app.vault.getMarkdownFiles(): TFile[]
-app.vault.getAbstractFileByPath(path: string): TAbstractFile | null
+- **Lazy loading**: Documents loaded on first access (WebSocket connect or REST bridge)
+- **Bootstrap**: If no saved CRDT state exists, builds document from existing DB files
+- **Thread safety**: Per-vault mutex prevents concurrent document mutations
+- **TOCTOU prevention**: Engine-level lock held during document load to prevent duplicate states
+- **Dirty tracking**: Only persists vaults with actual changes
+- **Context-based cancellation**: Persist loop stops cleanly on shutdown
 
-// Frontmatter
-app.fileManager.processFrontMatter(file: TFile, fn): Promise<void>
+**CRDT document schema per vault:**
 
-// Events
-app.vault.on('create', callback)
-app.vault.on('modify', callback)
-app.vault.on('delete', callback)
-app.vault.on('rename', callback)
-```
-
-**Plugin lifecycle:**
-
-```
-onload()
-  ├── Load settings from data.json
-  ├── Initialize Automerge document (load persisted state or create new)
-  ├── Register vault event listeners
-  ├── Open WebSocket connection to server
-  ├── Perform initial sync (full state comparison)
-  └── Register settings tab, commands, status bar item
-
-onunload()
-  ├── Persist Automerge state
-  ├── Close WebSocket connection
-  └── (Framework auto-cleans registered resources)
-```
-
----
-
-### 2. Server (`server/`)
-
-**Language:** Go
-**Database:** SQLite (+ sqlite-vec extension for embeddings)
-**Deployment:** Single static binary + SQLite database file
-
-The server is the central coordination point. All clients sync through
-it. It never needs to understand Markdown rendering or Obsidian's UI —
-it only manages CRDT state, file storage, authentication, and the API
-surface.
-
-**Package structure:**
-
-```
-server/
-├── cmd/
-│   └── server/
-│       └── main.go              # Entry point, config, startup
-├── internal/
-│   ├── auth/
-│   │   ├── jwt.go               # Token generation, validation
-│   │   ├── middleware.go        # HTTP/WebSocket auth middleware
-│   │   └── store.go             # User/credential storage
-│   ├── sync/
-│   │   ├── engine.go            # CRDT merge logic, change tracking
-│   │   ├── websocket.go         # WebSocket connection management
-│   │   ├── protocol.go          # Message types, serialization
-│   │   └── automerge.go         # Automerge Go bindings wrapper
-│   ├── vault/
-│   │   ├── store.go             # File read/write, metadata
-│   │   ├── snapshot.go          # Point-in-time vault snapshots
-│   │   └── watcher.go          # File system watcher (for local vaults)
-│   ├── graph/
-│   │   ├── linker.go            # Parse wiki-links from markdown
-│   │   ├── index.go             # Build and query vault_links table
-│   │   └── traversal.go        # Cycle-aware, budget-limited graph walks
-│   ├── api/
-│   │   ├── router.go            # Route definitions
-│   │   ├── handlers_vault.go    # Vault CRUD endpoints
-│   │   ├── handlers_sync.go     # Sync status, history
-│   │   ├── handlers_graph.go    # Link graph and backlink queries
-│   │   └── handlers_auth.go     # Login, register, refresh
-│   └── rag/                     # Future
-│       ├── embedder.go          # Chunking + embedding pipeline
-│       ├── index.go             # sqlite-vec operations
-│       └── query.go             # Semantic search
-├── migrations/
-│   ├── 001_initial.sql
-│   └── 002_link_graph.sql
-├── go.mod
-└── go.sum
-```
-
-#### 2.1 Sync Engine
-
-The sync engine is the core of the server. It manages CRDT state and
-coordinates changes between connected clients.
-
-**CRDT strategy — Automerge:**
-
-Automerge is a JSON-like CRDT library with a Rust core and bindings for
-multiple languages. This project uses:
-
-- **Go bindings** (`automerge-go`) on the server via CGO
-- **WASM build** (`@automerge/automerge`) in the plugin and web editor
-
-All three environments use the same underlying Rust implementation,
-guaranteeing identical merge semantics everywhere.
-
-**Data model:**
-
-Each vault is represented as a single Automerge document with this
-structure:
-
-```
+```json
 {
   "files": {
     "path/to/note.md": {
-      "content": Automerge.Text,   // CRDT text type for character-level merging
-      "frontmatter": { ... },      // Parsed YAML as Automerge map
-      "created": timestamp,
-      "modified": timestamp,
-      "hash": "sha256:..."         // Content hash for quick comparison
-    },
-    "attachments/image.png": {
-      "binary": Automerge.Bytes,   // Binary content stored as bytes
-      "created": timestamp,
-      "modified": timestamp,
-      "hash": "sha256:..."
+      "content": "<Automerge.Text>",
+      "hash": "sha256:...",
+      "modified": 1709827200000,
+      "is_binary": false
     }
-  },
-  "metadata": {
-    "vault_id": "uuid",
-    "vault_name": "My Vault",
-    "schema_version": 1
   }
 }
 ```
 
-**Why a single document per vault:**
+### WebSocket Protocol (`/api/sync/{vaultId}`)
 
-- Automerge handles the internal change tracking and compaction
-- Simplifies the sync protocol: clients exchange Automerge sync
-  messages, which encode only the deltas
-- Automerge's sync protocol is already designed for exactly this
-  pattern (two peers converging on a shared document)
+1. Client connects (no HTTP auth header required at upgrade)
+2. Client sends first message: `{"type":"auth","token":"<JWT>"}`
+3. Server validates token and vault ownership
+4. Server initializes Automerge sync state, sends initial sync message
+5. Both sides exchange binary Automerge sync messages
+6. Server sends WebSocket pings every 30s; clients must pong within 60s
+7. Message size limit: 16 MB
+8. Per-client sync state mutex prevents race conditions
 
-**Scaling consideration:** For very large vaults (10,000+ files), the
-document can be sharded by directory subtree into multiple Automerge
-documents. This is an optimization to defer, not a day-one requirement.
+**Goroutine lifecycle:**
+- `readPump`: reads client messages, closes `send` channel on exit
+- `writePump`: select loop over `send` channel and ping ticker, exits when channel closes
 
-**Sync protocol (WebSocket messages):**
+### Authentication
 
-```
-Client → Server:
-  { type: "sync",    data: <Automerge sync message bytes> }
-  { type: "request", data: { paths: ["file1.md", "file2.md"] } }
+- **JWT access tokens**: Short-lived (15 min), used in `Authorization: Bearer` header
+- **Refresh tokens**: Long-lived (30 days), stored as bcrypt hashes in SQLite
+- **Token rotation**: On refresh, new session created before old one is deleted (atomic ordering)
+- **Middleware**: Returns JSON error responses with proper `Content-Type: application/json`
+- **Logout endpoint**: Invalidates refresh token server-side
 
-Server → Client:
-  { type: "sync",    data: <Automerge sync message bytes> }
-  { type: "patch",   data: { patches: [...] } }  // Optional: decoded patches for UI
-  { type: "error",   data: { code: "...", message: "..." } }
+### Obsidian Plugin (`plugin/`)
 
-Bidirectional:
-  { type: "ping" } / { type: "pong" }
-```
+- TypeScript, built with esbuild (CommonJS, es2018)
+- Uses `@automerge/automerge` WASM for CRDT operations
+- Listens to Obsidian vault events (`create`, `modify`, `delete`, `rename`)
+- Maintains local Automerge document, syncs via WebSocket
+- Stores CRDT state in plugin data directory for offline support
 
-The heavy lifting is done by Automerge's built-in sync protocol. Each
-side maintains a `SyncState` and generates/receives `SyncMessage`
-objects. Automerge internally tracks which changes each peer has seen
-and only transmits missing changes.
+### Web Editor (`web/`)
 
-**Conflict resolution:**
+- **CodeMirror 6** with markdown syntax highlighting and Catppuccin Mocha dark theme
+- **Automerge WASM** (`fullfat_base64` entrypoint for browser compatibility)
+- **File tree** sidebar with hierarchical folder/file rendering
+- **Auth flow** with JWT access/refresh token rotation and concurrent refresh guard
+- **Remote changes** applied as minimal diffs (preserves cursor position and undo history)
+- **CRDT state** persisted to `sessionStorage` per vault for tab persistence
+- **Built with esbuild**, output to `dist/app.js`
 
-Because Automerge is a CRDT, there are no conflicts in the traditional
-sense — all changes merge deterministically. However, there are
-semantic conflicts (two users editing the same paragraph simultaneously)
-that produce merged text which may not read well. For these:
+### Docker Build
 
-- The plugin can surface "recent concurrent edits" in a UI panel
-- Automerge preserves full change history, so users can inspect and
-  revert
-- This is a UX concern, not a data integrity concern
+Multi-stage build (defined in `Dockerfile`):
 
-#### 2.2 Authentication
+1. **Node stage** (`node:20-alpine`): `npm ci` + `npm run build` for web editor
+2. **Go stage** (`golang:1.22-alpine`): CGO-enabled build for Automerge Go bindings
+3. **Runtime** (`alpine:3.19`): Server binary + web assets, healthcheck via `/api/health`
 
-**Mechanism:** JWT with access + refresh token pair.
-
-```
-Access token:  short-lived (15 min), used for API and WebSocket auth
-Refresh token: long-lived (30 days), stored securely, used to obtain new access tokens
-```
-
-**Flow:**
-
-```
-1. Client sends credentials (username + password) to POST /api/auth/login
-2. Server validates, returns { access_token, refresh_token }
-3. Client includes access_token in:
-   - REST: Authorization: Bearer <token>
-   - WebSocket: sent as first message after connection, or as query param
-4. On access_token expiry, client calls POST /api/auth/refresh
-5. Server validates refresh_token, issues new pair
-```
-
-**Password storage:** Argon2id hash (winner of the Password Hashing
-Competition, resistant to GPU/ASIC attacks).
-
-**Future:** OAuth 2.1 for third-party integrations, API keys for
-agent/automation access.
-
-#### 2.3 Vault Storage
-
-The server stores two representations of each vault:
-
-1. **Automerge document state** — the CRDT binary, stored as a blob in
-   SQLite. This is the source of truth for sync.
-2. **Materialized files** — the actual file tree on disk (or in SQLite
-   blob storage), derived from the Automerge state. Used for:
-   - Serving files to the web editor
-   - Input to the RAG embedding pipeline
-   - Backup/export
-
-#### 2.4 Link Graph
-
-Obsidian vaults form arbitrary directed graphs through wiki-links
-(`[[note]]`, `[[note|display text]]`) and embeds (`![[note]]`). These
-graphs are frequently cyclic — `A → B → C → A` is common and expected.
-The server materializes this graph into a dedicated table for efficient
-querying by both the RAG pipeline and agents.
-
-**Link parsing:**
-
-On every file change (create, modify, rename, delete), the server
-re-parses the affected file's content and updates the link graph. The
-parser handles all Obsidian link forms:
-
-```
-[[note]]                    → target: "note.md"
-[[note|display text]]       → target: "note.md", link_text: "display text"
-[[folder/note]]             → target: "folder/note.md"
-[[note#heading]]            → target: "note.md", anchor: "heading"
-[[note#heading|display]]    → target: "note.md", anchor: "heading"
-![[note]]                   → target: "note.md", is_embed: true
-![[image.png]]              → target: "image.png", is_embed: true
-```
-
-**Graph storage:**
-
-```sql
-CREATE TABLE vault_links (
-    vault_id    TEXT NOT NULL REFERENCES vaults(id),
-    source_path TEXT NOT NULL,          -- file containing the link
-    target_path TEXT NOT NULL,          -- resolved file the link points to
-    link_text   TEXT,                   -- display text from [[target|display]]
-    anchor      TEXT,                   -- heading anchor from [[note#heading]]
-    is_embed    BOOLEAN DEFAULT FALSE,  -- true for ![[embeds]]
-    position    INTEGER,               -- character offset in source file
-    PRIMARY KEY (vault_id, source_path, target_path, position)
-);
-
--- Backlink lookups: "what links to this note?"
-CREATE INDEX idx_links_target
-    ON vault_links(vault_id, target_path);
-
--- Forward link lookups: "what does this note link to?"
-CREATE INDEX idx_links_source
-    ON vault_links(vault_id, source_path);
-```
-
-**Cycle-aware traversal:**
-
-All graph traversal operations use a visited-set algorithm to handle
-cycles safely. The traversal engine provides two controls:
-
-- **`max_depth`** — how many link hops to follow (default: 1 for RAG,
-  configurable for agents)
-- **`max_nodes`** — total node budget for a single traversal (prevents
-  runaway walks in densely linked vaults)
-
-Pseudocode for the traversal:
-
-```go
-func Traverse(startPath string, maxDepth int, maxNodes int) []Node {
-    visited := map[string]bool{}
-    queue := []QueueItem{{path: startPath, depth: 0}}
-    result := []Node{}
-
-    for len(queue) > 0 && len(result) < maxNodes {
-        item := queue[0]
-        queue = queue[1:]
-
-        if visited[item.path] || item.depth > maxDepth {
-            continue
-        }
-        visited[item.path] = true
-
-        node := loadNode(item.path)
-        result = append(result, node)
-
-        if item.depth < maxDepth {
-            for _, link := range getOutboundLinks(item.path) {
-                if !visited[link.targetPath] {
-                    queue = append(queue, QueueItem{
-                        path:  link.targetPath,
-                        depth: item.depth + 1,
-                    })
-                }
-            }
-        }
-    }
-    return result
-}
-```
-
-**API endpoints:**
-
-```
-GET  /api/vaults/:id/graph/links?path=note.md
-     → Forward links from a file
-
-GET  /api/vaults/:id/graph/backlinks?path=note.md
-     → All files linking to this file
-
-POST /api/vaults/:id/graph/traverse
-     { "start": "note.md", "max_depth": 2, "max_nodes": 50 }
-     → Cycle-aware subgraph rooted at the given file
-
-GET  /api/vaults/:id/graph/stats
-     → Graph-level metrics: node count, edge count, strongly
-       connected components, orphan notes
+```bash
+docker build -t obsidian-center .
+docker run -p 8080:8080 \
+  -e OC_JWT_SECRET=your-secret-here \
+  -v obsidian-data:/data \
+  obsidian-center
 ```
 
 ---
 
-### 3. Web Editor (`web/`)
+## API Reference
 
-**Technology:** CodeMirror 6 + Automerge WASM
-**Deployment:** Static files served by the Go server
+### Auth (Public)
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/auth/register` | Create user account (username 3-64 chars, password 8+ chars) |
+| POST | `/api/auth/login` | Log in, returns access + refresh tokens |
+| POST | `/api/auth/refresh` | Rotate refresh token, get new token pair |
+| POST | `/api/auth/logout` | Invalidate refresh token |
 
-The web editor provides browser-based access to vaults. It connects to
-the same sync engine as the plugin, using the same Automerge WASM
-library and WebSocket protocol.
+### Health (Public)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/health` | Health check (returns `{"status":"ok"}`) |
 
-**Capabilities (phased):**
+### Vaults (Authenticated)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/vaults` | List user's vaults |
+| POST | `/api/vaults` | Create vault |
+| GET | `/api/vaults/{id}` | Get vault details |
+| DELETE | `/api/vaults/{id}` | Delete vault (204 No Content) |
 
-| Phase | Feature |
-|-------|---------|
-| 1     | Read-only vault browsing, file tree, markdown preview |
-| 2     | Full markdown editing with CodeMirror 6 |
-| 3     | Live collaboration (multiple cursors, presence) |
-| 4     | Obsidian-compatible rendering (callouts, embeds, links) |
+### Files (Authenticated)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/vaults/{id}/files` | List file metadata |
+| GET | `/api/vaults/{id}/files/{path}` | Get raw file content |
+| PUT | `/api/vaults/{id}/files/{path}` | Create/update file (raw body) |
+| DELETE | `/api/vaults/{id}/files/{path}` | Delete file (204 No Content) |
+| GET | `/api/vaults/{id}/snapshot` | Get all file hashes |
 
-**Why CodeMirror 6:**
+### Graph (Authenticated)
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/vaults/{id}/graph/links` | Outgoing links from a file |
+| GET | `/api/vaults/{id}/graph/backlinks` | Files linking to a given file |
+| POST | `/api/vaults/{id}/graph/traverse` | Cycle-aware graph traversal |
+| GET | `/api/vaults/{id}/graph/stats` | Graph statistics |
 
-- Obsidian uses CodeMirror 6 internally — similar editing experience
-- First-class extension API for custom syntax, decorations, widgets
-- Automerge has an official `@automerge/automerge-codemirror` binding
-  that wires CRDT changes directly to the editor
-
----
-
-### 4. Encryption
-
-**Approach:** Client-side (zero-knowledge). The server never sees
-plaintext vault content.
-
-**Algorithms:**
-
-- **AES-256-GCM** — authenticated encryption for file content
-- **scrypt** — key derivation from user-provided vault password
-- **HKDF** — derive per-file keys from the master key
-
-**Flow:**
-
-```
-1. User sets a vault encryption password in settings
-2. Client derives master key: scrypt(password, salt) → master_key
-3. For each file change:
-   a. Derive file key: HKDF(master_key, file_path) → file_key
-   b. Encrypt: AES-256-GCM(file_key, nonce, plaintext) → ciphertext
-   c. Send ciphertext through Automerge sync
-4. Server stores only ciphertext in the CRDT document
-5. Receiving clients decrypt using the same derived keys
-```
-
-**Tradeoff:** With E2E encryption enabled, server-side RAG indexing is
-not possible (the server cannot read content). Options:
-
-- Client-side embedding generation (slower, requires local model)
-- Selective encryption (encrypt sensitive notes, leave others
-  indexable)
-- Trusted server mode (no E2E encryption, server can index)
-
-This is a user-configurable choice per vault.
+### Sync
+| Method | Path | Description |
+|--------|------|-------------|
+| WS | `/api/sync/{id}` | WebSocket sync (auth via first message) |
 
 ---
 
-### 5. Future: RAG Pipeline
+## Testing
 
-**Embedding flow:**
+Integration tests in `server/internal/api/integration_test.go` cover:
 
-```
-Vault file changed
-  → Chunker splits into segments (by heading, paragraph, or sliding window)
-  → Link resolver enriches chunks with neighbor context (depth 1, cycle-aware)
-  → Embedder generates vectors (local model or API)
-  → sqlite-vec stores vectors with chunk metadata
-  → Semantic search available via REST API
-```
+- **Auth flow**: Register, login, refresh, logout, input validation, duplicate prevention
+- **Auth middleware**: JSON error responses, token enforcement on protected routes
+- **Vault CRUD**: Create, list, get, delete with proper status codes
+- **User isolation**: Users cannot see or access other users' vaults
+- **File CRUD**: PUT (raw body), GET (raw content), list, delete
+- **WebSocket sync**: Single client connect + auth + initial sync
+- **Dual WebSocket**: Two clients connecting to same vault simultaneously
+- **REST-to-CRDT bridge**: File PUT propagates to Automerge document
+- **Snapshot**: Multiple files returned with correct hashes
 
-**Chunking strategy for Obsidian markdown:**
-
-- Split on `##` headings (preserve document structure)
-- Each chunk includes the heading hierarchy as context
-- Frontmatter tags and properties are appended to each chunk
-- Typical chunk size: 512–1024 tokens
-
-**Wiki-link resolution for chunk enrichment:**
-
-Wiki-links (`[[note]]`) within a chunk are resolved using the link
-graph to append contextual summaries from linked notes. This enrichment
-is depth-limited and cycle-aware:
-
-- **Default depth: 1** — only direct links are resolved, not links
-  within linked notes
-- **Cycle guard** — a visited set prevents re-processing notes already
-  seen in the current enrichment pass
-- **Summary extraction** — linked notes contribute their title and
-  first paragraph (or frontmatter `description` field), not their full
-  content
-- **Budget** — a maximum of 10 linked-note summaries per chunk to
-  bound token usage
-
-Example: a chunk from `Architecture.md` containing `[[Authentication]]`
-and `[[Sync Engine]]` is enriched to:
-
-```
-[Original chunk content here...]
-
-[Linked: Authentication — JWT-based auth with access/refresh token pairs.
- The server issues short-lived access tokens and long-lived refresh tokens.]
-[Linked: Sync Engine — Automerge CRDT-based real-time synchronization.
- All state changes flow through a single Automerge document per vault.]
-```
-
-This gives the embedding model awareness of the note's local
-neighborhood without exploding into the full vault graph.
-
-**Search API:**
-
-```
-POST /api/vaults/:id/search
-{
-  "query": "How does authentication work?",
-  "limit": 20,
-  "filters": {
-    "tags": ["#architecture"],
-    "folders": ["projects/"]
-  }
-}
-
-Response:
-{
-  "results": [
-    {
-      "file": "projects/auth-design.md",
-      "heading": "## Token Flow",
-      "content": "...",
-      "score": 0.87
-    }
-  ]
-}
-```
-
----
-
-### 6. Future: Agent Runtime
-
-Agents are long-running goroutines that operate on vault content via
-the same CRDT layer. They read vault data, call external APIs (Claude,
-tools), and write results back to the vault.
-
-**Architecture:**
-
-```
-Agent goroutine
-  ├── Reads from Automerge document (vault content)
-  ├── Queries sqlite-vec (semantic search)
-  ├── Traverses link graph (cycle-aware, budget-limited)
-  ├── Calls Claude API (reasoning, generation)
-  ├── Writes results back to Automerge document
-  └── Changes sync to all connected clients automatically
-```
-
-**Link graph traversal for agents:**
-
-Agents need to follow wiki-link chains to research topics, build
-context, and discover related notes. Unlike RAG chunks (which use
-depth 1), agents traverse deeper but within explicit budgets:
-
-- **Configurable `max_depth`** — typically 2–3 for focused research,
-  up to 5 for broad exploration
-- **`max_nodes` budget** — caps the total notes visited per traversal
-  (default: 50). Prevents runaway walks in densely linked vaults with
-  thousands of interconnected notes
-- **Cycle handling** — visited-set guard ensures each note is processed
-  at most once per traversal, regardless of how many paths lead to it
-- **Traversal strategies:**
-  - **BFS** (breadth-first) — explores the immediate neighborhood
-    first. Good for "what's related to X?"
-  - **DFS** (depth-first) — follows a single thread deeply. Good for
-    "trace the chain from X to Y"
-  - **Weighted** — prioritize links based on semantic similarity to
-    the agent's current query (requires embedding comparison)
-
-**Use cases:**
-
-- Automatic note summarization
-- Link suggestion based on semantic similarity
-- Knowledge graph extraction from vault structure + content
-- Question answering over vault contents
-- Automated tagging and categorization
-
-Agents write to the vault through the same CRDT mechanism as any other
-client. Their changes merge seamlessly with user edits. Users see agent
-output appear in Obsidian in real time.
-
----
-
-## Database Schema
-
-```sql
--- Core tables
-
-CREATE TABLE users (
-    id          INTEGER PRIMARY KEY,
-    username    TEXT UNIQUE NOT NULL,
-    password    TEXT NOT NULL,          -- Argon2id hash
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE vaults (
-    id          TEXT PRIMARY KEY,       -- UUID
-    name        TEXT NOT NULL,
-    owner_id    INTEGER REFERENCES users(id),
-    crdt_state  BLOB,                  -- Automerge document binary
-    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE vault_files (
-    id          INTEGER PRIMARY KEY,
-    vault_id    TEXT REFERENCES vaults(id),
-    path        TEXT NOT NULL,
-    content     BLOB,                  -- File content (materialized)
-    hash        TEXT NOT NULL,         -- SHA-256
-    size        INTEGER NOT NULL,
-    is_binary   BOOLEAN DEFAULT FALSE,
-    created_at  DATETIME,
-    modified_at DATETIME,
-    UNIQUE(vault_id, path)
-);
-
-CREATE TABLE sessions (
-    id           TEXT PRIMARY KEY,
-    user_id      INTEGER REFERENCES users(id),
-    refresh_hash TEXT NOT NULL,        -- Hashed refresh token
-    expires_at   DATETIME NOT NULL,
-    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
--- Link graph
-
-CREATE TABLE vault_links (
-    vault_id    TEXT NOT NULL REFERENCES vaults(id),
-    source_path TEXT NOT NULL,          -- file containing the link
-    target_path TEXT NOT NULL,          -- resolved file the link points to
-    link_text   TEXT,                   -- display text from [[target|display]]
-    anchor      TEXT,                   -- heading anchor from [[note#heading]]
-    is_embed    BOOLEAN DEFAULT FALSE,  -- true for ![[embeds]]
-    position    INTEGER,               -- character offset in source file
-    PRIMARY KEY (vault_id, source_path, target_path, position)
-);
-
-CREATE INDEX idx_links_target
-    ON vault_links(vault_id, target_path);
-
-CREATE INDEX idx_links_source
-    ON vault_links(vault_id, source_path);
-
--- Future: embeddings
-
-CREATE VIRTUAL TABLE vec_chunks USING vec0(
-    chunk_id INTEGER PRIMARY KEY,
-    embedding float[1536]
-);
-
-CREATE TABLE chunks (
-    id        INTEGER PRIMARY KEY,
-    vault_id  TEXT REFERENCES vaults(id),
-    file_path TEXT NOT NULL,
-    content   TEXT NOT NULL,           -- Chunk text
-    start_pos INTEGER,
-    end_pos   INTEGER,
-    UNIQUE(vault_id, file_path, start_pos)
-);
+```bash
+cd server && go test -v ./...
 ```
 
 ---
@@ -717,124 +260,99 @@ CREATE TABLE chunks (
 
 ```
 obsidian-center/
-├── ARCHITECTURE.md          # This document
-├── plugin/                  # Obsidian plugin (TypeScript)
+├── ARCHITECTURE.md            # This document
+├── Dockerfile                 # Multi-stage: Node → Go → Alpine
+├── plugin/                    # Obsidian plugin (TypeScript)
 │   ├── src/
-│   │   ├── main.ts          # Plugin entry point
-│   │   ├── sync/            # Automerge WASM + WebSocket client
-│   │   ├── settings.ts      # Plugin settings UI
-│   │   └── crypto.ts        # Client-side encryption
+│   │   ├── main.ts            # Plugin entry point
+│   │   ├── sync/
+│   │   │   ├── crdt.ts        # Automerge WASM CRDT manager
+│   │   │   └── client.ts      # WebSocket sync client
+│   │   └── settings.ts        # Plugin settings UI
 │   ├── manifest.json
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── esbuild.config.mjs
-├── server/                  # Go server
+├── server/                    # Go server
 │   ├── cmd/server/
-│   │   └── main.go
+│   │   └── main.go            # Entry point, config, shutdown
 │   ├── internal/
-│   │   ├── auth/
-│   │   ├── sync/
-│   │   ├── vault/
-│   │   ├── graph/           # Link graph parsing, indexing, traversal
 │   │   ├── api/
-│   │   └── rag/             # Future
-│   ├── migrations/
+│   │   │   ├── router.go             # Route definitions
+│   │   │   ├── handlers_auth.go      # Register, login, refresh, logout
+│   │   │   ├── handlers_vault.go     # Vault + file CRUD, REST-CRDT bridge
+│   │   │   ├── handlers_sync.go      # WebSocket sync handler + hub
+│   │   │   ├── handlers_graph.go     # Link graph queries
+│   │   │   ├── helpers.go            # writeJSON, writeError
+│   │   │   └── integration_test.go   # Integration test harness
+│   │   ├── auth/
+│   │   │   ├── jwt.go         # Token generation/validation
+│   │   │   ├── middleware.go  # HTTP auth middleware (JSON errors)
+│   │   │   └── store.go       # User + session stores
+│   │   ├── sync/
+│   │   │   ├── engine.go      # CRDT engine, persist loop, REST bridge
+│   │   │   ├── doc.go         # VaultDoc (Automerge document wrapper)
+│   │   │   └── store_adapter.go  # CRDTStore interface adapter
+│   │   ├── vault/
+│   │   │   ├── store.go       # Vault + file SQLite operations
+│   │   │   ├── db.go          # Database open + WAL config
+│   │   │   └── migrations/    # Embedded SQL migrations
+│   │   └── graph/
+│   │       ├── linker.go      # Wiki-link parser
+│   │       ├── store.go       # Link graph SQL operations
+│   │       └── linker_test.go # Link parser tests
 │   ├── go.mod
 │   └── go.sum
-├── web/                     # Web editor (later phase)
+├── web/                       # Web editor (SPA)
 │   ├── src/
-│   ├── index.html
-│   └── package.json
-├── proto/                   # Shared protocol definitions
-│   └── messages.go          # Message types used by all components
-├── docker-compose.yml       # Development environment
-├── Dockerfile               # Server production build
-└── Makefile                 # Build, test, dev commands
+│   │   ├── main.ts            # Entry point, auth UI, vault loading
+│   │   ├── api.ts             # HTTP client with token refresh
+│   │   ├── editor.ts          # CodeMirror 6 wrapper + CRDT integration
+│   │   ├── filetree.ts        # File tree sidebar component
+│   │   ├── theme.ts           # Catppuccin Mocha dark theme
+│   │   └── sync/
+│   │       ├── crdt.ts        # Automerge WASM CRDT manager
+│   │       └── client.ts      # WebSocket sync client
+│   ├── index.html             # SPA shell
+│   ├── style.css              # Application styles
+│   ├── package.json
+│   ├── tsconfig.json
+│   └── esbuild.config.mjs     # Build config with Automerge WASM alias
+└── docker-compose.yml
 ```
 
 ---
 
-## Development Phases
+## Implementation Status
 
-### Phase 1 — Foundation
-- Go server skeleton (HTTP + WebSocket)
-- JWT authentication (register, login, refresh)
-- SQLite schema and migrations
-- Obsidian plugin skeleton (settings, lifecycle)
-- Basic file sync (no CRDT yet — hash-based last-write-wins)
-
-### Phase 2 — CRDT Sync
-- Integrate Automerge Go bindings on server
-- Integrate Automerge WASM in plugin
-- Implement sync protocol over WebSocket
-- Offline queue and reconnection logic
-- Multi-device testing
-
-### Phase 3 — Link Graph
-- Wiki-link parser (all Obsidian link forms)
-- `vault_links` table and incremental updates on file change
-- Backlink query API
-- Cycle-aware traversal engine with depth/node budgets
-- Graph statistics endpoint
-
-### Phase 4 — Web Editor
-- Static file serving from Go server
-- CodeMirror 6 markdown editor
-- Automerge WASM integration for live sync
-- File browser UI
-- Authentication flow in browser
-
-### Phase 5 — Encryption
-- Client-side AES-256-GCM encryption
-- Key derivation and management
-- Encrypted sync protocol
-- Per-vault encryption settings
-
-### Phase 6 — RAG
-- Markdown chunking pipeline
-- Depth-1 wiki-link enrichment for chunks (cycle-aware)
-- Embedding generation (local model or API)
-- sqlite-vec index
-- Semantic search API
-- Obsidian plugin search command
-
-### Phase 7 — Agents
-- Agent runtime framework
-- Claude API integration
-- Budget-limited link graph traversal for agent research
-- Vault read/write through CRDT layer
-- Agent management API
-- Agent configuration in Obsidian settings
+| Phase | Feature | Status |
+|-------|---------|--------|
+| 1 | Go server, JWT auth, SQLite, plugin skeleton | Done |
+| 2 | Automerge CRDT sync (server + plugin + WebSocket) | Done |
+| 3 | Link graph (parser, backlinks, traversal, stats) | Done |
+| 4 | Web editor (CodeMirror 6, Automerge WASM, file tree) | Done |
+| 5 | Encryption (client-side AES-256-GCM) | Planned |
+| 6 | RAG pipeline (embeddings, semantic search) | Planned |
+| 7 | Agent runtime (Claude API integration) | Planned |
 
 ---
 
 ## Design Principles
 
-1. **Single binary server.** No external runtime dependencies. SQLite
-   is embedded. The server is one `go build` away from deployment.
+1. **Single binary server.** No external runtime dependencies. SQLite is embedded.
+   One `go build` away from deployment.
 
-2. **CRDT-first.** All state changes flow through Automerge. This
-   guarantees convergence regardless of network conditions, client
-   count, or timing.
+2. **CRDT-first.** All state changes flow through Automerge. Guarantees convergence
+   regardless of network conditions, client count, or timing.
 
-3. **Obsidian is the UI.** The server never renders markdown or manages
-   layout. Obsidian handles all user-facing formatting. The web editor
-   is a lightweight supplement, not a replacement.
+3. **Obsidian is the UI.** The server never renders markdown. Obsidian handles all
+   user-facing formatting. The web editor is a lightweight supplement.
 
-4. **Zero-knowledge optional.** Users choose between full E2E
-   encryption (server cannot read content) and trusted-server mode
-   (enables server-side RAG). This is a per-vault setting.
+4. **Offline-first.** Every client maintains a complete local copy. The server is a
+   coordination point, not a dependency.
 
-5. **Offline-first.** Every client maintains a complete local copy. The
-   server is a coordination point, not a dependency. Clients function
-   fully offline and reconcile when connectivity returns.
+5. **REST-CRDT consistency.** REST file operations update the CRDT document, so
+   changes from any source (REST API, WebSocket, web editor) propagate to all peers.
 
-6. **Agents are peers.** AI agents interact with vault data through the
-   same CRDT sync layer as human users. No special write paths, no
-   separate storage — just another client making changes that merge
-   cleanly.
-
-7. **Graph-aware.** The link structure of a vault is a first-class data
-   model, not an afterthought. The server maintains a materialized link
-   graph, supports backlink queries, and provides cycle-safe traversal
-   primitives that both RAG and agents build on.
+6. **Graph-aware.** The link structure of a vault is a first-class data model with
+   materialized graph, backlink queries, and cycle-safe traversal primitives.

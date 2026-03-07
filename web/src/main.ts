@@ -91,9 +91,13 @@ async function doRegister() {
 
 function doLogout() {
   disconnectSync();
+  // Clear vault-specific CRDT state
+  if (currentVaultId) {
+    sessionStorage.removeItem(`oc_crdt_${currentVaultId}`);
+  }
   api.clearTokens();
-  sessionStorage.removeItem("oc_crdt_state");
   sessionStorage.removeItem("oc_vault_id");
+  currentVaultId = "";
   authScreen.hidden = false;
   editorScreen.hidden = true;
   authUsername.value = "";
@@ -148,8 +152,12 @@ async function showEditor() {
     currentVaultId = vaultSelect.value;
     sessionStorage.setItem("oc_vault_id", currentVaultId);
     await loadVault(currentVaultId);
-  } catch (e) {
+  } catch (e: any) {
     console.error("Failed to load vaults:", e);
+    // If auth failed, redirect to login
+    if (e?.message?.includes("401") || e?.message?.includes("unauthorized")) {
+      doLogout();
+    }
   }
 }
 

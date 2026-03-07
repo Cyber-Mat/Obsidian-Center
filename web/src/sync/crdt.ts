@@ -60,7 +60,9 @@ export class CRDTManager {
   }
 
   updateFileContent(path: string, content: string): void {
-    // Ensure file entry exists
+    const hash = this.contentHash(content);
+
+    // Ensure file entry exists and update metadata
     this.doc = Automerge.change(this.doc, `update ${path}`, (d) => {
       if (!d.files[path]) {
         d.files[path] = {
@@ -72,10 +74,11 @@ export class CRDTManager {
       }
       d.files[path].modified = Date.now();
       d.files[path].is_binary = false;
+      d.files[path].hash = hash;
     });
 
-    // Use updateText for character-level CRDT merging
-    Automerge.updateText(this.doc, ["files", path, "content"], content);
+    // Use updateText for character-level CRDT merging — must capture returned doc
+    this.doc = Automerge.updateText(this.doc, ["files", path, "content"], content);
   }
 
   deleteFile(path: string): void {
@@ -93,7 +96,7 @@ export class CRDTManager {
         is_binary: false,
       };
     });
-    Automerge.updateText(this.doc, ["files", path, "content"], content);
+    this.doc = Automerge.updateText(this.doc, ["files", path, "content"], content);
   }
 
   generateSyncMessage(): Uint8Array | null {
@@ -131,5 +134,15 @@ export class CRDTManager {
 
   resetSyncState(): void {
     this.syncState = Automerge.initSyncState();
+  }
+
+  private contentHash(data: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < data.length; i++) {
+      h ^= data.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    const prefix = (h >>> 0).toString(16).padStart(8, "0");
+    return `fnv:${prefix}:${data.length}`;
   }
 }

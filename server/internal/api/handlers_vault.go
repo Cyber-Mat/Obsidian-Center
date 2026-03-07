@@ -3,15 +3,18 @@ package api
 import (
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/Cyber-Mat/obsidian-center/server/internal/auth"
+	"github.com/Cyber-Mat/obsidian-center/server/internal/sync"
 	"github.com/Cyber-Mat/obsidian-center/server/internal/vault"
 )
 
 type VaultHandler struct {
 	vaults *vault.Store
+	engine *sync.Engine
 }
 
 type createVaultRequest struct {
@@ -40,7 +43,7 @@ func (h *VaultHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name == "" {
+	if strings.TrimSpace(req.Name) == "" {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
@@ -149,6 +152,13 @@ func (h *VaultHandler) PutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update CRDT document so the change propagates to connected peers
+	if h.engine != nil {
+		if err := h.engine.PutFileFromREST(id, path, content, isBinary); err != nil {
+			slog.Warn("failed to update CRDT from REST put", "vault", id, "path", path, "error", err)
+		}
+	}
+
 	writeJSON(w, http.StatusOK, f)
 }
 
@@ -165,6 +175,13 @@ func (h *VaultHandler) DeleteFile(w http.ResponseWriter, r *http.Request) {
 	if err := h.vaults.DeleteFile(id, path); err != nil {
 		writeError(w, http.StatusNotFound, "file not found")
 		return
+	}
+
+	// Update CRDT document so the deletion propagates to connected peers
+	if h.engine != nil {
+		if err := h.engine.DeleteFileFromREST(id, path); err != nil {
+			slog.Warn("failed to update CRDT from REST delete", "vault", id, "path", path, "error", err)
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
